@@ -128,6 +128,31 @@ python3 mlong-dl.py gui
   - 📀 Season:   `[100100] 📀 權力遊戲 - S01`
   - 🎞️ Episode:  `[100103] 🎞️ 權力遊戲 S01E03 「凱特」 [52分]`
 
+## 直接下載到 NAS（最簡單方案）
+
+**local GUI 跑 + NAS 只當網路硬碟** — 不在 NAS 上跑任何程式。
+
+```powershell
+# 1. NAS 開 SMB 分享（DSM → 控制台 → 共享資料夾 → 新增 Video）
+# 2. Windows 檔案總管 → 本機 → 連線網路磁碟機 → \\NAS_IP\Video → Z:\
+
+# 3. 開 GUI
+python3 mlong-dl.py gui
+# ⚙ 設定 tab → 下載目錄 → 選 Z:\mlong-dl\
+
+# 4. 抓片
+# 🔍 搜尋 → 雙擊 / [▶ 立即下載]
+# 自動下載到 Z:\mlong-dl\（NAS）
+```
+
+優點：
+- ✅ NAS 不用裝任何東西
+- ✅ local 端全速跑（不受 NAS 慢網影響）
+- ✅ 用完 NAS 直接關機也 OK（NAS 純當硬碟用）
+- ⚠️ 限制：local 電腦要開著才能下載
+
+如果要 NAS 24/7 跑，見 [NAS_DEPLOY.md](NAS_DEPLOY.md) 或 [NAS_DS214PLAY.md](NAS_DS214PLAY.md)。
+
 ## 補齊萌龍雅軒新 Folder 的 SOP
 
 萌龍偶爾會新增 folder。要補齊：
