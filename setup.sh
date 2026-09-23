@@ -66,22 +66,29 @@ else
     echo "✓ MLONG_API_KEY 已設定"
 fi
 
-# 6. 提示：可從 release 下載預建 DB（28 MB，省 14 分鐘）
+# 6. 提示：可從 release 下載預建 DB（3.5 MB 壓縮版，秒完成）
 echo ""
 echo "═══════════════════════════════════════"
 echo "🚀 想要預建的 DB 嗎？（省 14 分鐘 update）"
 echo ""
-echo "  GitHub Release 已上傳 db.json (28 MB, 124,283 items)。"
-echo "  下載後直接可用，不用跑 update。"
+echo "  GitHub Release 上有 db.json.gz (3.5 MB 壓縮版，124,283 items)。"
+echo "  解壓後是 28 MB 的 db.json。"
+echo "  下載完成直接可用。"
 echo ""
 read -p "要下載嗎？[y/N]: " DL
 if [[ "$DL" =~ ^[Yy]$ ]]; then
-    DB_URL="https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json"
-    echo "▶ 下載 db.json (28 MB)..."
+    DB_URL="https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
+    echo "▶ 下載 db.json.gz (3.5 MB)..."
     if command -v curl &> /dev/null; then
-        curl -L -o db.json "$DB_URL" && echo "✓ db.json 下載完成"
+        curl -L --progress-bar -o db.json.gz "$DB_URL" && \
+            python3 -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))" && \
+            rm db.json.gz && \
+            echo "✓ db.json 下載並解壓完成"
     elif command -v wget &> /dev/null; then
-        wget -O db.json "$DB_URL" && echo "✓ db.json 下載完成"
+        wget -O db.json.gz "$DB_URL" && \
+            python3 -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))" && \
+            rm db.json.gz && \
+            echo "✓ db.json 下載並解壓完成"
     else
         echo "✗ 找不到 curl 或 wget"
     fi
