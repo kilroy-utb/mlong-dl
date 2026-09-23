@@ -1491,7 +1491,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                 messagebox.showinfo("提示", "請先選一部電影")
                 return None
             line = self.search_listbox.get(sel[0])
-            m = re.match(r'\[(\d+)\]', line)
+            m = re.match(r'\[\s*(\d+)\]', line)
             if not m:
                 return None
             item_id = m.group(1)
