@@ -684,6 +684,12 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             menubar.add_cascade(label="說明", menu=help_m)
             root.config(menu=menubar)
 
+            # ============ status bar（先建，因為 tab 建時會用到） ============
+            status_frame = tk.Frame(root, relief='sunken', bd=1)
+            status_frame.pack(fill='x', side='bottom')
+            self.status_label = tk.Label(status_frame, text=f"就緒 · {len(db.movies)} 部電影", anchor='w')
+            self.status_label.pack(fill='x', padx=5, pady=2)
+
             # ============ 主體 Notebook ============
             self.notebook = ttk.Notebook(root)
             self.notebook.pack(fill='both', expand=True, padx=10, pady=5)
@@ -692,12 +698,6 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self._build_browse_tab()
             self._build_queue_tab()
             self._build_settings_tab()
-
-            # ============ 底部 status bar ============
-            status_frame = tk.Frame(root, relief='sunken', bd=1)
-            status_frame.pack(fill='x', side='bottom')
-            self.status_label = tk.Label(status_frame, text=f"就緒 · {len(db.movies)} 部電影", anchor='w')
-            self.status_label.pack(fill='x', padx=5, pady=2)
 
         # ── Tab 1: 搜尋 ─────────────────────
         def _build_search_tab(self):
