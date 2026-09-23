@@ -725,7 +725,22 @@ def download_with_ytdlp(url: str, output_path: Path, title_hint: str = "") -> bo
     - 失敗自動 retry
     """
     ytdlp = find_ytdlp()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # v1.5.9：明確錯誤訊息（WinError 5 通常是資料夾不存在或沒權限）
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError as e:
+        raise RuntimeError(
+            f"無法建立下載目錄：{output_path.parent}\n"
+            f"原因：{e}\n"
+            f"修法：1) 手動建好資料夾  2) 確認有寫入權限\n"
+            f"  （GUI ⚙ 設定 tab 改下載目錄到有權限的位置）"
+        ) from e
+    except OSError as e:
+        raise RuntimeError(
+            f"下載目錄錯誤：{output_path.parent}\n"
+            f"原因：{type(e).__name__}: {e}"
+        ) from e
 
     # 如果 find_ytdlp() 回傳 "python -m yt_dlp" 格式（因為找不到 .exe 但模組在）
     # 就用 list-style command
