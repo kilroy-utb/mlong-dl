@@ -62,6 +62,28 @@ def detect_nas_dir() -> Optional[Path]:
 
     try:
         if system == 'Windows':
+            # 先用 net use 找出所有 UNC mount，建立 drive -> unc 路徑 mapping
+            unc_map = {}  # drive letter -> UNC path
+            try:
+                import subprocess
+                # Windows 10/11 語系不同，輸出格式有差。用寬鬆解析。
+                out = subprocess.run(['net', 'use'], capture_output=True, text=True, timeout=3,
+                                     encoding='mbcs', errors='replace')
+                # 找 UNC path + drive letter
+                # UNC 格式: \\server\share[\subpath...]
+                # 例: "\\192.168.213.60\video"
+                # regex 拆解：
+                #   r'\\\\' = literal \\\
+                #   r'([^\\s]+(?:\\[^\\s]+)*)' = 路徑部分（server\share\sub）
+                #   r'\s+([A-Z]):' = 空白 + drive letter
+                unc_re = re.compile(r'\\\\([^\\\s]+(?:\\[^\\\s]+)*)\s+([A-Z]):')
+                for m in unc_re.finditer(out.stdout):
+                    unc_path = '\\\\' + m.group(1)  # 重建完整路徑（含 \\）
+                    drive_letter = m.group(2) + ':'
+                    unc_map[drive_letter] = unc_path
+            except Exception:
+                pass
+
             # 掃 drive letter A-Z
             import string
             for letter in string.ascii_uppercase:
@@ -69,28 +91,13 @@ def detect_nas_dir() -> Optional[Path]:
                 if not drive.exists():
                     continue
                 try:
-                    # 檢查容量（NAS 通常大）
-                    import shutil
-                    usage = shutil.disk_usage(str(drive))
-                    size_gb = usage.total / (1024**3)
-                    # 大於 500GB 或 UNC 路徑（沒在 C:/ 之類本機）
-                    name = ''
-                    try:
-                        # 從 net use / 用 win32api 找 UNC
-                        import subprocess
-                        out = subprocess.run(['net', 'use'], capture_output=True, text=True, timeout=3)
-                        for line in out.stdout.splitlines():
-                            if drive.name in line and '\\\\' in line:
-                                # 格式: "\\server\share" "Z:" "Microsoft Windows Network"
-                                parts = line.split()
-                                if parts and parts[0].startswith('\\\\'):
-                                    name = parts[0]
-                                    break
-                    except:
-                        pass
-                    # 容量大 (>= 500GB) 或有 UNC name → 視為 NAS 候選
-                    if size_gb >= 500 or name:
-                        candidates.append((drive, name or f'{size_gb:.0f}GB 本機'))
+                    drive_key = f"{letter}:"
+                    unc_path = unc_map.get(drive_key, '')
+
+                    if unc_path:
+                        # 只有真正有 UNC mount 的才視為 NAS
+                        # 排除本機硬碟（C:/ D:/ 等沒掛 UNC 的）
+                        candidates.append((drive, unc_path))
                 except (OSError, ImportError):
                     pass
         elif system == 'Darwin':  # macOS
