@@ -164,11 +164,17 @@ print(f'  ✓ 存到 $DB ({len(data)} bytes)')
             [[ -s "$DB" ]] && DOWNLOADED=yes
         fi
 
-        if [[ "$DOWNLOADED" == "yes" ]] && [[ -s "$DB" ]]; then
-            rm -f "$DB_GZ"
-            DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || stat -f%z "$DB" 2>/dev/null)
-            echo ""
-            echo "✓ db.json 完成（$DB_SIZE bytes）"
+        if [[ "$DOWNLOADED" == "yes" ]] && [[ -s "$DB_GZ" ]]; then
+            echo "▶ 用 $PY 解壓 $DB_GZ → $DB ..."
+            "$PY" -c "import gzip; open('$DB','wb').write(gzip.decompress(open('$DB_GZ','rb').read()))" 2>&1 | tail -3
+            if [[ -s "$DB" ]]; then
+                rm -f "$DB_GZ"
+                DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || stat -f%z "$DB" 2>/dev/null)
+                echo ""
+                echo "✓ db.json 完成（$DB_SIZE bytes）"
+            else
+                echo "✗ 解壓失敗"
+            fi
         else
             echo ""
             echo "✗ 全部下載方法都失敗"
