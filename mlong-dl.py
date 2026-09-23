@@ -47,11 +47,51 @@ DEFAULT_DEVICE_ID = "4068e636-c8e6-4a84-80aa-24dd4a40aefa"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "mlong-dl"
 DB_PATH = Path(__file__).parent / "db.json"
 
-# 萌龍雅軒的 library folder ID（可在 server 上找到）
+# 萌龍雅軒的 library folder ID（從 /Items?ParentId=2 取得 17 個 folder）
+# 電影 6 個 + 劇集 9 個 + 特殊 2 個
 KNOWN_FOLDERS = {
-    "chinese": 3,      # 华语电影
-    "foreign": 515,    # 外语电影
-    "anime": None,     # 动画电影（user 可從 devtools 找）
+    # ── 電影 ──────────────────────────────
+    "chinese":       3,    # 华语电影 (movies)
+    "foreign":       515,  # 外语电影 (movies)
+    "anime_movie":   3211, # 动画电影 (movies)
+    "horror":        16018, # 恐怖电影 (movies)
+    "art":           42629, # 艺术电影 (movies)
+    "concert":       65159, # 演唱会 (movies)
+    # ── 劇集 (TV) ──────────────────────────
+    "chinese_tv":    3359, # 国产剧集 (tvshows)
+    "jp_kr_tv":      5345, # 日韩剧集 (tvshows)
+    "western_tv":    5510, # 欧美剧集 (tvshows)
+    "jp_anime":      5604, # 日番动漫 (tvshows)
+    "western_anime": 32397, # 欧美动漫 (tvshows)
+    "chinese_anime": 46752, # 国产动漫 (tvshows)
+    "kids":          48072, # 儿童节目 (tvshows)
+    "variety":       65332, # 综艺节目 (tvshows)
+    "documentary":   65336, # 纪录片 (tvshows)
+    # ── 特殊 ──────────────────────────────
+    "collections":   89934, # 合集 (boxsets)
+    "playlists":     105645, # 播放列表 (playlists)
+}
+
+# 每個 folder 要抓的 Item 類型（劇集 folder 預設遞迴抓到 Episode）
+FOLDER_TYPES = {
+    # folder_key: [Type 列表]
+    "chinese":       ['Movie'],
+    "foreign":       ['Movie'],
+    "anime_movie":   ['Movie'],
+    "horror":        ['Movie'],
+    "art":           ['Movie'],
+    "concert":      ['Series', 'Season', 'Episode'],  # 演唱會可能是 series
+    "chinese_tv":    ['Series', 'Season', 'Episode'],
+    "jp_kr_tv":      ['Series', 'Season', 'Episode'],
+    "western_tv":    ['Series', 'Season', 'Episode'],
+    "jp_anime":      ['Series', 'Season', 'Episode'],
+    "western_anime": ['Series', 'Season', 'Episode'],
+    "chinese_anime": ['Series', 'Season', 'Episode'],
+    "kids":          ['Series', 'Season', 'Episode'],
+    "variety":       ['Series', 'Season', 'Episode'],
+    "documentary":   ['Series', 'Season', 'Episode'],
+    "collections":   ['Episode'],
+    "playlists":     ['Episode'],
 }
 
 
@@ -171,8 +211,12 @@ class MlongClient:
         print(f"✓ Server: {info.get('ServerName')} v{info.get('Version')}")
         return True
 
-    def list_folder_all(self, parent_id: int, label: str = '') -> list:
-        """完整抓一個 folder 所有影片（自動翻頁）。"""
+    def list_folder_all(self, parent_id: int, label: str = '',
+                         include_types: list = None) -> list:
+        """完整抓一個 folder 所有 items（自動翻頁）。
+        include_types: list of Jellyfin Type，例如 ['Movie'] 或 ['Series', 'Season', 'Episode']
+                       None = 不限類型（但會多抓 folder 物件）。
+        """
         movies = []
         start = 0
         page = 100
@@ -183,7 +227,12 @@ class MlongClient:
                 'Limit': page,
                 'StartIndex': start,
                 'Recursive': 'true',
+                'Fields': 'Name,ProductionYear,RunTimeTicks,Type,'
+                          'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,'
+                          'Overview,ParentId',
             }
+            if include_types:
+                params['IncludeItemTypes'] = ','.join(include_types)
             r = self.s.get(self._url('/Items'), params=params)
             r.raise_for_status()
             data = r.json()
@@ -192,19 +241,28 @@ class MlongClient:
                 break
             total = data.get('TotalRecordCount', 0)
             for it in items:
-                if it.get('Type') == 'Movie':
-                    name = it.get('Name', '')
-                    year = ''
-                    m = re.search(r'\((\d{4})\)', name)
-                    if m:
-                        year = m.group(1)
-                    movies.append({
-                        'id': str(it.get('Id')),
-                        'name': name,
-                        'year': year,
-                        'folder': label,
-                        'runtime_ticks': it.get('RunTimeTicks', 0),
-                    })
+                it_type = it.get('Type', '')
+                if include_types and it_type not in include_types:
+                    continue
+                name = it.get('Name', '')
+                year = ''
+                m = re.search(r'\((\d{4})\)', name)
+                if m:
+                    year = m.group(1)
+                movies.append({
+                    'id': str(it.get('Id')),
+                    'name': name,
+                    'year': year,
+                    'folder': label,
+                    'type': it_type,
+                    # Season/Episode 編號在 Jellyfin 有兩種命名：
+                    #   Episode: IndexNumber=ep_num, ParentIndexNumber=season_num
+                    #   Season:  IndexNumber=season_num
+                    'season': it.get('ParentIndexNumber') if it_type == 'Episode' else it.get('IndexNumber'),
+                    'episode': it.get('IndexNumber') if it_type == 'Episode' else None,
+                    'series_name': it.get('SeriesName', ''),
+                    'runtime_ticks': it.get('RunTimeTicks', 0),
+                })
             print(f"  [{label}] {start + len(items)}/{total}", end='\r')
             start += len(items)
             if start >= total or len(items) < page:
@@ -282,9 +340,10 @@ def cmd_update(args, client: MlongClient, db: MovieDB):
         if parent_id is None:
             print(f"  ⚠ {label}: ParentId 未設定，跳過")
             continue
-        print(f"  抓 {label} (ParentId={parent_id})...")
-        movies = client.list_folder_all(parent_id, label)
-        print(f"  ✓ {label}: {len(movies)} 部")
+        include_types = FOLDER_TYPES.get(label, ['Movie'])
+        print(f"  抓 {label} (ParentId={parent_id}, types={','.join(include_types)})...")
+        movies = client.list_folder_all(parent_id, label, include_types=include_types)
+        print(f"  ✓ {label}: {len(movies)} 項")
         all_movies.extend(movies)
 
     # 去重（同一 ID 不會重複，但保險起見）
@@ -493,13 +552,40 @@ class DownloadWorker:
             except Exception:
                 pass
 
+    def _make_filename(self, m):
+        """產生輸出檔名（依 type 分類）。
+        Movie:    阿凡达 (2009).mp4
+        Series:   權力遊戲 (2011).mp4
+        Season:   權力遊戲 - S01.mp4
+        Episode:  權力遊戲 - S01E03 「名稱」.mp4
+        """
+        t = m.get('type', 'Movie')
+        base = re.sub(r'[\\/:*?"<>|]', '_', m['name'])[:200]
+        year = m.get('year', '')
+
+        if t == 'Series':
+            # 不實際下載（Series 沒 media source），但保留格式一致
+            return self.output_dir / f"{base}{' ('+year+')' if year else ''}.mp4"
+        elif t == 'Season':
+            sn = m.get('season') or 1
+            series = m.get('series_name') or base
+            series_safe = re.sub(r'[\\/:*?"<>|]', '_', series)[:100]
+            return self.output_dir / f"{series_safe} - S{int(sn):02d}.mp4"
+        elif t == 'Episode':
+            sn = m.get('season') or 1
+            ep = m.get('episode') or 1
+            series = m.get('series_name') or base
+            series_safe = re.sub(r'[\\/:*?"<>|]', '_', series)[:100]
+            ep_safe = re.sub(r'[\\/:*?"<>|]', '_', base)[:100]
+            return self.output_dir / f"{series_safe} - S{int(sn):02d}E{int(ep):02d} 「{ep_safe}」.mp4"
+        else:
+            return self.output_dir / f"{base}{' ('+year+')' if year else ''}.mp4"
+
     def _run(self):
         try:
             ytdlp = find_ytdlp()
-            safe_name = re.sub(r'[\\/:*?"<>|]', '_', self.movie['name'])[:200]
-            year = self.movie.get('year', '')
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.output_path = self.output_dir / f"{safe_name}{' ('+year+')' if year else ''}.mp4"
+            self.output_path = self._make_filename(self.movie)
 
             cmd = [
                 ytdlp,
@@ -645,12 +731,47 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self.search_results = list(db.movies)
             self._refresh_search_list()
 
+        def _format_item(self, m):
+            """格式化一個 item 給 listbox 顯示。
+            Movie:        [   51465] 阿凡达 (2009) [179分]
+            Series:       [  100000] 權力遊戲 (2011) [8季]
+            Season:       [  100100] 權力遊戲 - S01 [10集]
+            Episode:      [  100103] 權力遊戲 - S01E03 「名稱」 [52分]
+            """
+            t = m.get('type', 'Movie')
+            year = f" ({m['year']})" if m.get('year') else ''
+            ticks = m.get('runtime_ticks', 0)
+            runtime = ''
+            if ticks:
+                if t == 'Episode':
+                    runtime = f" [{ticks//600000000}分]"
+                elif t == 'Series':
+                    # Series 的 ticks 是「整個 series 總時長」，不適合直接顯示，改用季數
+                    # 但 RunTimeTicks 對 Series 是 sum of episodes
+                    total_min = ticks // 600000000
+                    if total_min:
+                        runtime = f" [{total_min}分]"
+                else:
+                    runtime = f" [{ticks//600000000}分]"
+
+            if t == 'Series':
+                return f"[{m['id']:>10}] {m['name']}{year}{runtime} [Series]"
+            elif t == 'Season':
+                sn = m.get('season') or '?'
+                return f"[{m['id']:>10}] {m['series_name']} - S{int(sn):02d}{year} [Season]"
+            elif t == 'Episode':
+                sn = m.get('season') or '?'
+                ep = m.get('episode') or '?'
+                series = m.get('series_name') or ''
+                ep_name = m['name']
+                return f"[{m['id']:>10}] {series} S{int(sn):02d}E{int(ep):02d} 「{ep_name}」{year}{runtime}"
+            else:  # Movie / unknown
+                return f"[{m['id']:>10}] {m['name']}{year}{runtime}"
+
         def _refresh_search_list(self):
             self.search_listbox.delete(0, 'end')
             for m in self.search_results:
-                year = f" ({m['year']})" if m.get('year') else ''
-                runtime = f" [{m['runtime_ticks']//600000000}分]" if m.get('runtime_ticks') else ''
-                self.search_listbox.insert('end', f"[{m['id']:>10}] {m['name']}{year}{runtime}")
+                self.search_listbox.insert('end', self._format_item(m))
 
         def on_search(self, *args):
             q = self.query_var.get().strip()
@@ -747,10 +868,10 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
             self.browse_listbox.delete(0, 'end')
             for m in movies:
-                year = f" ({m['year']})" if m.get('year') else ''
-                runtime = f" [{m['runtime_ticks']//600000000}分]" if m.get('runtime_ticks') else ''
+                # browse 額外加 folder 標籤
+                line = self._format_item(m)
                 folder_tag = f" [{m['folder']}]" if m.get('folder') else ''
-                self.browse_listbox.insert('end', f"[{m['id']:>10}] {m['name']}{year}{runtime}{folder_tag}")
+                self.browse_listbox.insert('end', line + folder_tag)
 
             self.browse_count_label.config(text=f"顯示 {len(movies)} / {len(self.db.movies)} 部")
             self.browse_movies = movies
