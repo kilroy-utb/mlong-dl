@@ -649,6 +649,7 @@ class Config:
             'window_size': (900, 600),
             'concurrent_downloads': 1,
             'last_query': '',
+            'max_display': 500,  # v1.4.1: listbox 一次顯示幾筆
         }
         self.load()
 
@@ -930,6 +931,19 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self.search_listbox.bind('<Double-Button-1>', lambda e: self.start_download_selected())
             self.search_listbox.bind('<Return>', lambda e: self.start_download_selected())
 
+            # v1.4.1：分頁按鈕列
+            ctrl = ttk.Frame(tab)
+            ctrl.pack(fill='x', padx=5, pady=(0, 5))
+            ttk.Button(ctrl, text="載入更多",
+                       command=self._load_more_search).pack(side='left', padx=2)
+            ttk.Button(ctrl, text="顯示全部（會卡）",
+                       command=self._show_all_search).pack(side='left', padx=2)
+            ttk.Label(ctrl, text="顯示筆數:").pack(side='left', padx=(20, 2))
+            self.max_display_var = tk.IntVar(value=self.config.get('max_display', 500))
+            ttk.Spinbox(ctrl, from_=100, to=10000, increment=500,
+                        textvariable=self.max_display_var, width=8).pack(side='left')
+            ttk.Button(ctrl, text="套用", command=self._apply_max_display).pack(side='left', padx=2)
+
             self.search_results = []
             self._apply_search_filter()
 
@@ -1047,12 +1061,67 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                 return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
 
         def _refresh_search_list(self):
+            """v1.4.1：只 insert 前 MAX_DISPLAY 筆，剩餘顯示「載入更多」。
+            124k 全 insert = 216ms；只插 500 = 8ms。
+            """
+            max_disp = self.config.get('max_display', 500)
+            total = len(self.search_results)
+            display_items = self.search_results[:max_disp]
+
             self.search_listbox.delete(0, 'end')
-            for m in self.search_results:
-                # v1.4.0：用預先算好的 _display，不用每次重算
+            for m in display_items:
                 display = m.get('_display') or MovieDB._format_display(m)
                 self.search_listbox.insert('end', display)
-            self.status_label.config(text=f"顯示 {len(self.search_results):,} 筆")
+
+            if total > max_disp:
+                more = total - max_disp
+                self.status_label.config(
+                    text=f"顯示 {max_disp:,} / {total:,} 筆 "
+                         f"（還有 {more:,} 筆沒顯示，按 [載入更多]）")
+            else:
+                self.status_label.config(text=f"顯示 {total:,} 筆")
+
+        def _apply_max_display(self):
+            """套用 Spinbox 的 max_display 值，存到 config 並重新整理。"""
+            new_val = self.max_display_var.get()
+            self.config.set('max_display', new_val)
+            self.config.save()
+            self._refresh_search_list()
+            self.status_label.config(text=f"max_display → {new_val}")
+
+        def _load_more_search(self):
+            """按「載入更多」：append 額外 MAX_DISPLAY 筆到 listbox。"""
+            max_disp = self.config.get('max_display', 500)
+            current = self.search_listbox.size()
+            next_end = current + max_disp
+            new_items = self.search_results[current:next_end]
+
+            for m in new_items:
+                display = m.get('_display') or MovieDB._format_display(m)
+                self.search_listbox.insert('end', display)
+
+            total = len(self.search_results)
+            shown = self.search_listbox.size()
+            if shown < total:
+                self.status_label.config(
+                    text=f"顯示 {shown:,} / {total:,} 筆 "
+                         f"（還有 {total-shown:,} 筆，按 [載入更多]）")
+            else:
+                self.status_label.config(text=f"顯示全部 {total:,} 筆")
+
+        def _show_all_search(self):
+            """顯示全部（會卡，警告後執行）。"""
+            total = len(self.search_results)
+            if total > 5000:
+                from tkinter import messagebox
+                if not messagebox.askyesno(
+                    "確認", f"插入 {total:,} 筆會卡 {total*1.7/1000:.1f} 秒。\n繼續？"):
+                    return
+            self.search_listbox.delete(0, 'end')
+            for m in self.search_results:
+                display = m.get('_display') or MovieDB._format_display(m)
+                self.search_listbox.insert('end', display)
+            self.status_label.config(text=f"顯示全部 {total:,} 筆")
 
         def on_search(self, *args):
             """舊版 callback — redirect 到新版。"""
@@ -1127,6 +1196,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             bottom.pack(fill='x', padx=5, pady=5)
             ttk.Button(bottom, text="▶ 下載選中", command=self.browse_download_selected).pack(side='left', padx=2)
             ttk.Button(bottom, text="+ 全部加入佇列", command=self.browse_add_all_to_queue).pack(side='left', padx=2)
+            ttk.Button(bottom, text="載入更多", command=self._load_more_browse).pack(side='left', padx=2)
             self.browse_count_label = ttk.Label(bottom, text="")
             self.browse_count_label.pack(side='right', padx=5)
 
@@ -1152,15 +1222,40 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             elif sort == '時長（長→短）':
                 movies.sort(key=lambda m: -m.get('runtime_ticks', 0))
 
+            # v1.4.1：只 insert 前 MAX_DISPLAY 筆
+            max_disp = self.config.get('max_display', 500)
+            display_items = movies[:max_disp]
             self.browse_listbox.delete(0, 'end')
-            for m in movies:
-                # v1.4.0：用預先算好的 _display + 加 folder 標籤
+            for m in display_items:
                 line = m.get('_display') or MovieDB._format_display(m)
                 folder_tag = f" [{m['folder']}]" if m.get('folder') else ''
                 self.browse_listbox.insert('end', line + folder_tag)
 
-            self.browse_count_label.config(text=f"顯示 {len(movies)} / {len(self.db.movies)} 部")
+            total = len(movies)
+            if total > max_disp:
+                self.browse_count_label.config(
+                    text=f"顯示 {max_disp:,} / {total:,} 部（按 [載入更多]）")
+            else:
+                self.browse_count_label.config(text=f"顯示 {total:,} / {len(self.db.movies):,} 部")
             self.browse_movies = movies
+
+        def _load_more_browse(self):
+            """Browse tab 載入更多。"""
+            max_disp = self.config.get('max_display', 500)
+            current = self.browse_listbox.size()
+            next_end = current + max_disp
+            new_items = self.browse_movies[current:next_end]
+            for m in new_items:
+                line = m.get('_display') or MovieDB._format_display(m)
+                folder_tag = f" [{m['folder']}]" if m.get('folder') else ''
+                self.browse_listbox.insert('end', line + folder_tag)
+            total = len(self.browse_movies)
+            shown = self.browse_listbox.size()
+            if shown < total:
+                self.browse_count_label.config(
+                    text=f"顯示 {shown:,} / {total:,} 部（按 [載入更多]）")
+            else:
+                self.browse_count_label.config(text=f"顯示 {total:,} / {len(self.db.movies):,} 部")
 
         def _get_browse_selected(self):
             sels = self.browse_listbox.curselection()
