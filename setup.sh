@@ -101,55 +101,78 @@ if [[ "$DL" =~ ^[Yy]$ ]]; then
     else
         echo "▶ 下載 db.json.gz (3.5 MB)..."
         echo "  CWD: $TARGET_DIR"
+        echo "  PY: $PY"
 
-        # 多種方法 try，總有一個會 work
+        # 多種方法 try，每個都印結果
         DOWNLOADED=no
         if [[ "$DOWNLOADED" == "no" ]] && command -v curl &> /dev/null; then
-            echo "  用 curl..."
-            curl -L -o "$DB_GZ" "$DB_URL" 2>/dev/null
+            echo "  [1/4] 用 curl..."
+            curl -L -o "$DB_GZ" "$DB_URL" 2>&1 | tail -3
             [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+            echo "      result: $DOWNLOADED"
         fi
         if [[ "$DOWNLOADED" == "no" ]] && command -v wget &> /dev/null; then
-            echo "  用 wget..."
-            wget -O "$DB_GZ" "$DB_URL" 2>/dev/null
+            echo "  [2/4] 用 wget..."
+            wget -O "$DB_GZ" "$DB_URL" 2>&1 | tail -3
             [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+            echo "      result: $DOWNLOADED"
         fi
         if [[ "$DOWNLOADED" == "no" ]] && command -v powershell.exe &> /dev/null; then
-            echo "  用 PowerShell..."
-            powershell.exe -Command "Invoke-WebRequest -Uri '$DB_URL' -OutFile '$DB_GZ' -UseBasicParsing" 2>/dev/null
+            echo "  [3/4] 用 PowerShell..."
+            powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri '$DB_URL' -OutFile '$DB_GZ' -UseBasicParsing" 2>&1 | tail -5
             [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+            echo "      result: $DOWNLOADED"
         fi
         if [[ "$DOWNLOADED" == "no" ]] && command -v powershell &> /dev/null; then
-            echo "  用 PowerShell (no .exe)..."
-            powershell -Command "Invoke-WebRequest -Uri '$DB_URL' -OutFile '$DB_GZ' -UseBasicParsing" 2>/dev/null
+            echo "  [4/4] 用 PowerShell (no .exe)..."
+            powershell -NoProfile -Command "Invoke-WebRequest -Uri '$DB_URL' -OutFile '$DB_GZ' -UseBasicParsing" 2>&1 | tail -5
             [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+            echo "      result: $DOWNLOADED"
         fi
 
+        # 全部失敗 → 等手動下載
         if [[ "$DOWNLOADED" == "no" ]]; then
             echo ""
-            echo "✗ 自動下載失敗（沒找到 curl / wget / powershell）"
+            echo "╔═══════════════════════════════════════════╗"
+            echo "║  自動下載失敗（curl/wget/powershell 都不行）  ║"
+            echo "╚═══════════════════════════════════════════╝"
             echo ""
             echo "  請手動下載："
             echo "  1. 瀏覽器開 https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
             echo "  2. 存到 $TARGET_DIR/db.json.gz"
             echo "  3. 按 Enter 繼續"
             echo ""
-            read
+            read -p "  按 Enter..."
             [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
         fi
 
-        if [[ "$DOWNLOADED" == "yes" ]] && [[ -s "$DB_GZ" ]]; then
-            echo "▶ 用 $PY 解壓..."
-            "$PY" -c "import gzip; open('$DB','wb').write(gzip.decompress(open('$DB_GZ','rb').read()))"
+        # 全部失敗（包括手動也沒放）→ 教用 python urllib 抓
+        if [[ "$DOWNLOADED" == "no" ]]; then
+            echo ""
+            echo "  還是用 Python urllib 試："
+            "$PY" -c "
+import urllib.request, gzip
+url = '$DB_URL'
+print('  下載中...')
+data = urllib.request.urlopen(url, timeout=30).read()
+print(f'  下載 {len(data)} bytes')
+data = gzip.decompress(data)
+with open('$DB', 'wb') as f:
+    f.write(data)
+print(f'  ✓ 存到 $DB ({len(data)} bytes)')
+" 2>&1 | tail -10
+            [[ -s "$DB" ]] && DOWNLOADED=yes
+        fi
+
+        if [[ "$DOWNLOADED" == "yes" ]] && [[ -s "$DB" ]]; then
             rm -f "$DB_GZ"
-            if [[ -s "$DB" ]]; then
-                DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || stat -f%z "$DB" 2>/dev/null)
-                echo "✓ db.json 解壓完成（$DB_SIZE bytes）"
-            else
-                echo "✗ 解壓失敗"
-            fi
+            DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || stat -f%z "$DB" 2>/dev/null)
+            echo ""
+            echo "✓ db.json 完成（$DB_SIZE bytes）"
         else
-            echo "✗ 還是沒有 db.json.gz"
+            echo ""
+            echo "✗ 全部下載方法都失敗"
+            echo "  跑 update 重建 DB：python mlong-dl.py update（會花 14 分鐘）"
         fi
     fi
 fi
