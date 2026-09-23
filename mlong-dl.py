@@ -277,6 +277,24 @@ class MovieDB:
         return [m for m in self.movies
                 if m.get('type') == 'Season' and m.get('series_name') == sname]
 
+    def get_series_tree_ids(self, series_id: str) -> set:
+        """v2.0：給定 series_id，回傳所有相關的 ids（series + seasons + episodes）。
+        用於 update 單 series 時移除舊 entry。
+        """
+        series = self._by_id.get(series_id)
+        if not series:
+            return {series_id}
+        sname = series['name']
+        ids = {series_id}
+        for m in self.movies:
+            # series 自己
+            if m['id'] == series_id:
+                ids.add(m['id'])
+            # 任何 season / episode 屬於這個 series
+            if m.get('series_name') == sname:
+                ids.add(m['id'])
+        return ids
+
 
 # ═══════════════════════════════════════════════════════════
 # MlongClient — 只用於「更新 DB」指令
