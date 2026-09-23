@@ -36,9 +36,27 @@ except ImportError:
 # ── 常數 ────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
 DB_PATH = SCRIPT_DIR / 'db.json'
-DOWNLOAD_DIR = SCRIPT_DIR / 'downloads'
+DEFAULT_DOWNLOAD_DIR = SCRIPT_DIR / 'downloads'  # 預設值（GUI 可改、CLI 可 --output 覆蓋）
 DEFAULT_SERVER = 'https://mlong.cutedragon.vip:8888'
 DEFAULT_DEVICE_ID = '4068e636-c8e6-4a84-80aa-24dd4a40aefa'
+
+# GUI 用的全域 mutable 下載目錄（GUI 啟動時 init，cmd_gui 也會讀 env 變數）
+_current_download_dir: Optional[Path] = None
+
+
+def get_download_dir() -> Path:
+    """取得目前下載目錄（GUI 可改，CLI 用 env 或 --output）。"""
+    if _current_download_dir is not None:
+        return _current_download_dir
+    return DEFAULT_DOWNLOAD_DIR
+
+
+def set_download_dir(path) -> Path:
+    """設定下載目錄。回傳 normalized Path。"""
+    global _current_download_dir
+    _current_download_dir = Path(path).expanduser().resolve()
+    _current_download_dir.mkdir(parents=True, exist_ok=True)
+    return _current_download_dir
 
 # 17 個萌龍 folder
 KNOWN_FOLDERS = {
@@ -603,13 +621,14 @@ def build_url(item_id: str, api_key: str) -> str:
 # ═══════════════════════════════════════════════════════════
 class _DownloadItem:
     """單一下載任務的狀態。"""
-    __slots__ = ('id', 'name', 'kind', 'status', 'downloaded', 'total',
+    __slots__ = ('id', 'name', 'kind', 'path', 'status', 'downloaded', 'total',
                  'speed', 'eta', 'error')
 
-    def __init__(self, id_: str, name: str, kind: str):
+    def __init__(self, id_: str, name: str, kind: str, path: str = ''):
         self.id = id_
         self.name = name
         self.kind = kind           # Movie / Episode / Season
+        self.path = path           # 下載到哪個資料夾（顯示用）
         self.status = 'queued'     # queued / downloading / ok / error
         self.downloaded = 0
         self.total = 0
@@ -630,9 +649,9 @@ class DownloadTracker:
         self._items = {}   # id -> _DownloadItem
 
     # ── 寫入（背景 thread） ──────────────────────────────
-    def add(self, id_: str, name: str, kind: str) -> None:
+    def add(self, id_: str, name: str, kind: str, path: str = '') -> None:
         with self._lock:
-            self._items[id_] = _DownloadItem(id_, name, kind)
+            self._items[id_] = _DownloadItem(id_, name, kind, path)
 
     def update_progress(self, id_: str, downloaded: int, total: int,
                         speed: int, eta: int) -> None:
@@ -663,7 +682,7 @@ class DownloadTracker:
         with self._lock:
             return [
                 {
-                    'id': it.id, 'name': it.name, 'kind': it.kind,
+                    'id': it.id, 'name': it.name, 'kind': it.kind, 'path': it.path,
                     'status': it.status, 'downloaded': it.downloaded,
                     'total': it.total, 'speed': it.speed, 'eta': it.eta,
                     'error': it.error,
@@ -751,8 +770,15 @@ def run_gui(api_key: str):
     update_btn['menu'] = update_menu
     update_btn.pack(side='left', padx=20)
 
-    # 顯示下載目錄
-    ttk.Button(top, text='📁 ' + str(DOWNLOAD_DIR), command=lambda: open_download_dir()).pack(side='right')
+    # 下載目錄 Menubutton（顯示目前路徑，dropdown：改資料夾 / 打開）
+    download_dir_btn = ttk.Menubutton(top, text='📂 ' + str(get_download_dir()))
+    download_dir_menu = tk.Menu(download_dir_btn, tearoff=0)
+    download_dir_menu.add_command(label='📂 改資料夾...', command=lambda: change_download_dir())
+    download_dir_menu.add_command(label='📁 打開目前資料夾', command=lambda: open_download_dir())
+    download_dir_menu.add_separator()
+    download_dir_menu.add_command(label='↺ 回到預設', command=lambda: reset_download_dir())
+    download_dir_btn['menu'] = download_dir_menu
+    download_dir_btn.pack(side='right')
 
     # ── 結果區 (lazy — 沒搜尋結果不顯示) ──────────────────────
     # ── Notebook 分頁：搜尋結果 / 下載進度 ────────────────
@@ -811,20 +837,22 @@ def run_gui(api_key: str):
     progress_tree_container.pack(fill='both', expand=True)
 
     progress_tree = ttk.Treeview(progress_tree_container,
-                                 columns=('name', 'progress', 'size', 'speed', 'eta', 'status'),
+                                 columns=('name', 'path', 'progress', 'size', 'speed', 'eta', 'status'),
                                  show='headings', height=18)
     progress_tree.heading('name', text='名稱')
+    progress_tree.heading('path', text='位置')
     progress_tree.heading('progress', text='進度')
     progress_tree.heading('size', text='大小')
     progress_tree.heading('speed', text='速度')
     progress_tree.heading('eta', text='剩餘')
     progress_tree.heading('status', text='狀態')
-    progress_tree.column('name', width=240, anchor='w')
-    progress_tree.column('progress', width=140, anchor='w')
-    progress_tree.column('size', width=140, anchor='e')
-    progress_tree.column('speed', width=90, anchor='e')
-    progress_tree.column('eta', width=70, anchor='e')
-    progress_tree.column('status', width=60, anchor='center')
+    progress_tree.column('name', width=220, anchor='w')
+    progress_tree.column('path', width=180, anchor='w')
+    progress_tree.column('progress', width=130, anchor='w')
+    progress_tree.column('size', width=130, anchor='e')
+    progress_tree.column('speed', width=85, anchor='e')
+    progress_tree.column('eta', width=65, anchor='e')
+    progress_tree.column('status', width=55, anchor='center')
 
     prog_scroll = ttk.Scrollbar(progress_tree_container, orient='vertical',
                                 command=progress_tree.yview)
@@ -852,7 +880,12 @@ def run_gui(api_key: str):
             iid = existing.get(name)
             size_text = (f'{_fmt_bytes(it["downloaded"])} / {_fmt_bytes(it["total"])}'
                          if it['total'] > 0 else f'{_fmt_bytes(it["downloaded"])} / ?')
+            # 顯示 path：太長截斷中間（...）
+            path_disp = it.get('path', '')
+            if len(path_disp) > 30:
+                path_disp = path_disp[:12] + '...' + path_disp[-15:]
             row = (name,
+                   path_disp,
                    _progress_bar_text(it['downloaded'], it['total']),
                    size_text,
                    _fmt_speed(it['speed']),
@@ -1031,15 +1064,16 @@ def run_gui(api_key: str):
     def download_episodes_series(series, episodes):
         # 切到進度頁
         notebook.select(1)
+        cur_dir = get_download_dir()
         for i, ep in enumerate(episodes, 1):
             update_status(f'[{i}/{len(episodes)}] 下載: {ep["name"]}')
             result_listbox.selection_clear(0, 'end')
             result_listbox.selection_set(i - 1 if i - 1 < result_listbox.size() else 0)
             root.update_idletasks()
-            tracker.add(ep['id'], ep['name'], ep.get('type', 'Episode'))
+            tracker.add(ep['id'], ep['name'], ep.get('type', 'Episode'), str(cur_dir))
             def _cb(d, t, s, e, _id=ep['id']):
                 tracker.update_progress(_id, d, t, s, e)
-            status, info = download_one(ep, str(DOWNLOAD_DIR), api_key,
+            status, info = download_one(ep, str(cur_dir), api_key,
                                         progress_callback=_cb)
             if status == 'error':
                 tracker.mark_done(ep['id'], ok=False, error=str(info))
@@ -1056,10 +1090,11 @@ def run_gui(api_key: str):
     def download_one_thread(item):
         # 切到進度頁
         notebook.select(1)
-        tracker.add(item['id'], item['name'], item.get('type', 'Movie'))
+        cur_dir = get_download_dir()
+        tracker.add(item['id'], item['name'], item.get('type', 'Movie'), str(cur_dir))
         def _cb(d, t, s, e, _id=item['id']):
             tracker.update_progress(_id, d, t, s, e)
-        status, info = download_one(item, str(DOWNLOAD_DIR), api_key,
+        status, info = download_one(item, str(cur_dir), api_key,
                                     progress_callback=_cb)
         if status == 'error':
             tracker.mark_done(item['id'], ok=False, error=str(info))
@@ -1165,15 +1200,32 @@ def run_gui(api_key: str):
     # ── 開下載資料夾 ──────────────────────────────────────
     def open_download_dir():
         try:
-            DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            cur = get_download_dir()
+            cur.mkdir(parents=True, exist_ok=True)
             if sys.platform == 'win32':
-                os.startfile(str(DOWNLOAD_DIR))
+                os.startfile(str(cur))
             elif sys.platform == 'darwin':
-                subprocess.Popen(['open', str(DOWNLOAD_DIR)])
+                subprocess.Popen(['open', str(cur)])
             else:
-                subprocess.Popen(['xdg-open', str(DOWNLOAD_DIR)])
+                subprocess.Popen(['xdg-open', str(cur)])
         except Exception as e:
             messagebox.showerror('錯誤', str(e))
+
+    def change_download_dir():
+        from tkinter import filedialog
+        new = filedialog.askdirectory(title='選擇下載資料夾',
+                                      initialdir=str(get_download_dir()))
+        if not new:
+            return
+        set_download_dir(new)
+        download_dir_btn.config(text='📂 ' + str(get_download_dir()))
+        update_status(f'下載目錄已改為 {get_download_dir()}')
+
+    def reset_download_dir():
+        global _current_download_dir
+        _current_download_dir = None
+        download_dir_btn.config(text='📂 ' + str(get_download_dir()))
+        update_status(f'下載目錄已回到預設 {get_download_dir()}')
 
     # ── 底部 status bar ─────────────────────────────────────
     status_var = tk.StringVar(value=f'就緒 · {len(db.movies):,} 筆')
@@ -1262,7 +1314,7 @@ def cmd_download(args):
     item = db.get(args.item_id)
     if not item:
         item = {'id': args.item_id, 'name': f'item_{args.item_id}', 'type': 'Movie'}
-    out_dir = args.output or str(DOWNLOAD_DIR)
+    out_dir = args.output or str(get_download_dir())
     os.environ['MLONG_API_KEY'] = api_key  # 給 download_one 用
 
     if item.get('type') == 'Series':
