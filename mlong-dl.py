@@ -704,19 +704,60 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             tab = ttk.Frame(self.notebook)
             self.notebook.add(tab, text="🔍 搜尋")
 
-            # 搜尋框
+            # ── 快捷分類列 ─────────────────────
+            quick_frame = ttk.Frame(tab)
+            quick_frame.pack(fill='x', padx=5, pady=(8, 2))
+            ttk.Label(quick_frame, text="快捷:", font=('TkFixedFont', 10)).pack(side='left')
+
+            # 統計一次（給按鈕 label 用）
+            n_total = len(db.movies)
+            n_movie = sum(1 for m in db.movies if m.get('type') == 'Movie')
+            n_series_ep = sum(1 for m in db.movies if m.get('type') in ('Series', 'Season', 'Episode'))
+            n_art = sum(1 for m in db.movies if m.get('folder') == 'art')
+            n_anime = sum(1 for m in db.movies if m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime'))
+            n_doc = sum(1 for m in db.movies if m.get('folder') == 'documentary')
+            n_concert = sum(1 for m in db.movies if m.get('folder') == 'concert')
+
+            def make_btn(text, command):
+                b = ttk.Button(quick_frame, text=text, command=command)
+                b.pack(side='left', padx=2)
+                return b
+
+            self.quick_filter = tk.StringVar(value='all')
+
+            def set_filter(value):
+                self.quick_filter.set(value)
+                self._apply_search_filter()
+
+            make_btn(f"全部 {n_total:,}", lambda: set_filter('all'))
+            make_btn(f"🎬 電影 {n_movie:,}", lambda: set_filter('movie'))
+            make_btn(f"📺 劇集 {n_series_ep:,}", lambda: set_filter('tv'))
+            make_btn(f"🎞️ 動漫 {n_anime:,}", lambda: set_filter('anime'))
+            make_btn(f"🎨 文藝 {n_art:,}", lambda: set_filter('art'))
+            make_btn(f"📚 紀錄 {n_doc:,}", lambda: set_filter('doc'))
+            make_btn(f"🎤 演唱 {n_concert:,}", lambda: set_filter('concert'))
+
+            # ── 搜尋列 ────────────────────────
             top = ttk.Frame(tab)
             top.pack(fill='x', padx=5, pady=5)
             ttk.Label(top, text="搜尋:").pack(side='left')
             self.query_var = tk.StringVar(value=self.config.get('last_query', ''))
-            self.query_var.trace('w', self.on_search)
-            entry = ttk.Entry(top, textvariable=self.query_var, width=60)
+            self.query_var.trace('w', self._apply_search_filter)
+            entry = ttk.Entry(top, textvariable=self.query_var, width=50)
             entry.pack(side='left', padx=5)
             entry.bind('<Return>', lambda e: self.start_download_selected())
-            ttk.Button(top, text="▶ 立即下載", command=self.start_download_selected).pack(side='left', padx=2)
+
+            ttk.Label(top, text="類型:").pack(side='left')
+            self.type_filter = tk.StringVar(value='全部')
+            type_combo = ttk.Combobox(top, textvariable=self.type_filter, state='readonly', width=10)
+            type_combo['values'] = ['全部', 'Movie', 'Series', 'Season', 'Episode']
+            type_combo.pack(side='left', padx=2)
+            type_combo.bind('<<ComboboxSelected>>', lambda e: self._apply_search_filter())
+
+            ttk.Button(top, text="▶ 立即下載", command=self.start_download_selected).pack(side='left', padx=4)
             ttk.Button(top, text="+ 加入佇列", command=self.add_to_queue).pack(side='left', padx=2)
 
-            # Listbox
+            # ── Listbox ───────────────────────
             mid = ttk.Frame(tab)
             mid.pack(fill='both', expand=True, padx=5, pady=5)
             self.search_listbox = tk.Listbox(mid, font=('TkFixedFont', 11), selectmode='single')
@@ -727,61 +768,106 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self.search_listbox.bind('<Double-Button-1>', lambda e: self.start_download_selected())
             self.search_listbox.bind('<Return>', lambda e: self.start_download_selected())
 
-            # 預設顯示全部
-            self.search_results = list(db.movies)
+            self.search_results = []
+            self._apply_search_filter()
+
+        def _apply_search_filter(self, *args):
+            """套用：搜尋字串 + 快捷分類 + 類型下拉。"""
+            q = self.query_var.get().strip()
+            self.config.set('last_query', q)
+
+            base = list(self.db.movies)
+
+            # 快捷分類
+            quick = self.quick_filter.get()
+            if quick == 'movie':
+                base = [m for m in base if m.get('type') == 'Movie']
+            elif quick == 'tv':
+                base = [m for m in base if m.get('type') in ('Series', 'Season', 'Episode')]
+            elif quick == 'anime':
+                base = [m for m in base if m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime')]
+            elif quick == 'art':
+                base = [m for m in base if m.get('folder') == 'art']
+            elif quick == 'doc':
+                base = [m for m in base if m.get('folder') == 'documentary']
+            elif quick == 'concert':
+                base = [m for m in base if m.get('folder') == 'concert']
+
+            # 類型下拉
+            t = self.type_filter.get()
+            if t != '全部':
+                base = [m for m in base if m.get('type') == t]
+
+            # 搜尋字串
+            if q:
+                base = self.db.search(q, limit=200)
+                # 套用前面的過濾
+                if quick != 'all':
+                    quick_filter_func = {
+                        'movie': lambda m: m.get('type') == 'Movie',
+                        'tv': lambda m: m.get('type') in ('Series', 'Season', 'Episode'),
+                        'anime': lambda m: m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime'),
+                        'art': lambda m: m.get('folder') == 'art',
+                        'doc': lambda m: m.get('folder') == 'documentary',
+                        'concert': lambda m: m.get('folder') == 'concert',
+                    }
+                    base = [m for m in base if quick_filter_func[quick](m)]
+                if t != '全部':
+                    base = [m for m in base if m.get('type') == t]
+
+            self.search_results = base
             self._refresh_search_list()
+            self.status_label.config(text=f"篩選 {quick}/{t} → {len(self.search_results):,} 筆")
 
         def _format_item(self, m):
             """格式化一個 item 給 listbox 顯示。
-            Movie:        [   51465] 阿凡达 (2009) [179分]
-            Series:       [  100000] 權力遊戲 (2011) [8季]
-            Season:       [  100100] 權力遊戲 - S01 [10集]
-            Episode:      [  100103] 權力遊戲 - S01E03 「名稱」 [52分]
+            Movie:        [   51465] 🎬 阿凡达 (2009) [179分]
+            Series:       [  100000] 📺 權力遊戲 (2011) [8季]
+            Season:       [  100100] 📀 權力遊戲 - S01
+            Episode:      [  100103] 🎞️ 權力遊戲 S01E03 「凱特」 [52分]
             """
             t = m.get('type', 'Movie')
             year = f" ({m['year']})" if m.get('year') else ''
             ticks = m.get('runtime_ticks', 0)
             runtime = ''
             if ticks:
-                if t == 'Episode':
-                    runtime = f" [{ticks//600000000}分]"
-                elif t == 'Series':
-                    # Series 的 ticks 是「整個 series 總時長」，不適合直接顯示，改用季數
-                    # 但 RunTimeTicks 對 Series 是 sum of episodes
-                    total_min = ticks // 600000000
-                    if total_min:
-                        runtime = f" [{total_min}分]"
-                else:
-                    runtime = f" [{ticks//600000000}分]"
+                total_min = ticks // 600000000
+                if total_min:
+                    runtime = f" [{total_min}分]"
 
-            if t == 'Series':
-                return f"[{m['id']:>10}] {m['name']}{year}{runtime} [Series]"
+            # Emoji + Type 標記
+            TYPE_EMOJI = {
+                'Movie':    '🎬',
+                'Series':   '📺',
+                'Season':   '📀',
+                'Episode':  '🎞️',
+            }
+            emoji = TYPE_EMOJI.get(t, '❓')
+
+            if t == 'Movie':
+                return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+            elif t == 'Series':
+                return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
             elif t == 'Season':
                 sn = m.get('season') or '?'
-                return f"[{m['id']:>10}] {m['series_name']} - S{int(sn):02d}{year} [Season]"
+                return f"[{m['id']:>10}] {emoji} {m.get('series_name', '?')} - S{int(sn):02d}"
             elif t == 'Episode':
                 sn = m.get('season') or '?'
                 ep = m.get('episode') or '?'
                 series = m.get('series_name') or ''
-                ep_name = m['name']
-                return f"[{m['id']:>10}] {series} S{int(sn):02d}E{int(ep):02d} 「{ep_name}」{year}{runtime}"
-            else:  # Movie / unknown
-                return f"[{m['id']:>10}] {m['name']}{year}{runtime}"
+                return f"[{m['id']:>10}] {emoji} {series} S{int(sn):02d}E{int(ep):02d} 「{m['name']}」{runtime}"
+            else:
+                return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
 
         def _refresh_search_list(self):
             self.search_listbox.delete(0, 'end')
             for m in self.search_results:
                 self.search_listbox.insert('end', self._format_item(m))
+            self.status_label.config(text=f"顯示 {len(self.search_results):,} 筆")
 
         def on_search(self, *args):
-            q = self.query_var.get().strip()
-            self.config.set('last_query', q)
-            if not q:
-                self.search_results = list(self.db.movies)
-            else:
-                self.search_results = self.db.search(q, limit=200)
-            self._refresh_search_list()
-            self.status_label.config(text=f"搜尋 '{q}' → {len(self.search_results)} 筆")
+            """舊版 callback — redirect 到新版。"""
+            self._apply_search_filter()
 
         def _get_selected_movie(self):
             sel = self.search_listbox.curselection()
@@ -817,7 +903,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
             top = ttk.Frame(tab)
             top.pack(fill='x', padx=5, pady=5)
-            ttk.Label(top, text="類別:").pack(side='left')
+            ttk.Label(top, text="Folder:").pack(side='left')
             self.browse_folder = tk.StringVar(value='全部')
             folder_combo = ttk.Combobox(top, textvariable=self.browse_folder, state='readonly', width=15)
             folders = ['全部'] + sorted({m['folder'] for m in db.movies if m.get('folder')})
@@ -825,7 +911,14 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             folder_combo.pack(side='left', padx=5)
             folder_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_browse_list())
 
-            ttk.Label(top, text="排序:").pack(side='left', padx=(20, 0))
+            ttk.Label(top, text="類型:").pack(side='left', padx=(10, 0))
+            self.browse_type = tk.StringVar(value='全部')
+            type_combo = ttk.Combobox(top, textvariable=self.browse_type, state='readonly', width=10)
+            type_combo['values'] = ['全部', 'Movie', 'Series', 'Season', 'Episode']
+            type_combo.pack(side='left', padx=5)
+            type_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_browse_list())
+
+            ttk.Label(top, text="排序:").pack(side='left', padx=(10, 0))
             self.browse_sort = tk.StringVar(value='名稱')
             sort_combo = ttk.Combobox(top, textvariable=self.browse_sort, state='readonly', width=15)
             sort_combo['values'] = ['名稱', '年份（新→舊）', '年份（舊→新）', '時長（長→短）']
@@ -855,6 +948,10 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             folder = self.browse_folder.get()
             if folder != '全部':
                 movies = [m for m in movies if m.get('folder') == folder]
+
+            t = self.browse_type.get()
+            if t != '全部':
+                movies = [m for m in movies if m.get('type') == t]
 
             sort = self.browse_sort.get()
             if sort == '名稱':
