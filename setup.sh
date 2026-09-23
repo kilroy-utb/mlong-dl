@@ -66,13 +66,34 @@ else
     echo "✓ MLONG_API_KEY 已設定"
 fi
 
-# 6. 第一次跑 update
+# 6. 提示：可從 release 下載預建 DB（28 MB，省 14 分鐘）
+echo ""
+echo "═══════════════════════════════════════"
+echo "🚀 想要預建的 DB 嗎？（省 14 分鐘 update）"
+echo ""
+echo "  GitHub Release 已上傳 db.json (28 MB, 124,283 items)。"
+echo "  下載後直接可用，不用跑 update。"
+echo ""
+read -p "要下載嗎？[y/N]: " DL
+if [[ "$DL" =~ ^[Yy]$ ]]; then
+    DB_URL="https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json"
+    echo "▶ 下載 db.json (28 MB)..."
+    if command -v curl &> /dev/null; then
+        curl -L -o db.json "$DB_URL" && echo "✓ db.json 下載完成"
+    elif command -v wget &> /dev/null; then
+        wget -O db.json "$DB_URL" && echo "✓ db.json 下載完成"
+    else
+        echo "✗ 找不到 curl 或 wget"
+    fi
+fi
+
+# 8. 用法
 echo ""
 echo "═══════════════════════════════════════"
 echo "現在可以跑了："
 echo ""
-echo "  python3 mlong-dl.py update     # 建本地 DB"
-echo "  python3 mlong-dl.py dl '電影名'"
-echo "  python3 mlong-dl.py gui"
+echo "  python3 mlong-dl.py dl '電影名'     # 搜尋 + 下載"
+echo "  python3 mlong-dl.py gui             # 開 GUI（4 tab）"
+echo "  python3 mlong-dl.py update          # 從萌龍重建 DB（如果資料過時）"
 echo ""
 echo "更多：python3 mlong-dl.py --help"
