@@ -551,7 +551,6 @@ def download_one(item: dict, output_dir: str, api_key: str,
     cmd = ytdlp_cmd + [
         '-o', str(out_file.with_suffix('.%(ext)s')),
         '--no-mtime', '--no-part', '--newline',
-        '--no-warnings',
         '--concurrent-fragments', '8',
         '--retries', '10',
         '--fragment-retries', '10',
@@ -563,18 +562,24 @@ def download_one(item: dict, output_dir: str, api_key: str,
     if status_callback:
         status_callback(f'下載中: {item["name"]}...')
 
+    # v2.2 debug：把 yt-dlp 完整輸出寫到 debug_ytdlp.log（方便診斷進度沒更新）
+    debug_log = Path(output_dir).parent / 'debug_ytdlp.log'
+
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
         last_total = 0  # 用於沒拿到 total 時 fallback
-        for line in proc.stdout:
-            line = line.rstrip()
-            parsed = _parse_yt_dlp_progress(line)
-            if parsed and progress_callback:
-                downloaded, total, speed, eta = parsed
-                if total > 0:
-                    last_total = total
-                progress_callback(downloaded, last_total, speed, eta)
+        with open(debug_log, 'a', encoding='utf-8') as df:
+            df.write(f'\n=== {item["name"]} ({item_id}) ===\n')
+            for line in proc.stdout:
+                line = line.rstrip()
+                df.write(line + '\n')
+                parsed = _parse_yt_dlp_progress(line)
+                if parsed and progress_callback:
+                    downloaded, total, speed, eta = parsed
+                    if total > 0:
+                        last_total = total
+                    progress_callback(downloaded, last_total, speed, eta)
         proc.wait(timeout=3600)
         if proc.returncode == 0 and out_file.exists():
             return ('ok', str(out_file))
