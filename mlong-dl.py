@@ -930,6 +930,10 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             sb.pack(side='right', fill='y')
             self.search_listbox.bind('<Double-Button-1>', lambda e: self.start_download_selected())
             self.search_listbox.bind('<Return>', lambda e: self.start_download_selected())
+            # v1.4.2：scroll-to-bottom 自動載入
+            sb.bind('<MouseWheel>', self._on_search_scroll)
+            sb.bind('<Button-4>', self._on_search_scroll)      # Linux scroll up
+            sb.bind('<Button-5>', self._on_search_scroll)      # Linux scroll down
 
             # v1.4.1：分頁按鈕列
             ctrl = ttk.Frame(tab)
@@ -999,7 +1003,8 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             # ── 步驟 2：套搜尋字串（用 inverted index）──
             if q:
                 # search() 已做簡繁轉 + 排序
-                candidates = self.db.search(q, limit=200)
+                # v1.4.2：放寬 limit 到 1000（搜尋 35ms 仍即時，給更多結果）
+                candidates = self.db.search(q, limit=1000)
                 # 套 quick + type filter
                 if quick != 'all':
                     fn = QUICK_FILTERS.get(quick)
@@ -1089,8 +1094,26 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self._refresh_search_list()
             self.status_label.config(text=f"max_display → {new_val}")
 
-        def _load_more_search(self):
-            """按「載入更多」：append 額外 MAX_DISPLAY 筆到 listbox。"""
+        def _on_search_scroll(self, event=None):
+            """scrollwheel 事件：判斷是否捲到底，到底就自動載入更多。"""
+            # 用 root.after 延遲執行（避免在 scroll 事件中改 listbox 衝突）
+            self.root.after(50, self._maybe_load_more_search)
+
+        def _maybe_load_more_search(self):
+            """檢查 listbox 是否捲到底，是的話載入下一批。"""
+            try:
+                # yview 回傳 (top, bottom) 兩個 0-1 的數字
+                top, bottom = self.search_listbox.yview()
+                # bottom >= 0.95 視為到底
+                if bottom >= 0.95:
+                    self._load_more_search(silent=True)
+            except Exception:
+                pass
+
+        def _load_more_search(self, silent=False):
+            """按「載入更多」：append 額外 MAX_DISPLAY 筆到 listbox。
+            silent=True：scroll-to-bottom 自動呼叫，仍更新 status 顯示 X / Y。
+            """
             max_disp = self.config.get('max_display', 500)
             current = self.search_listbox.size()
             next_end = current + max_disp
@@ -1105,7 +1128,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             if shown < total:
                 self.status_label.config(
                     text=f"顯示 {shown:,} / {total:,} 筆 "
-                         f"（還有 {total-shown:,} 筆，按 [載入更多]）")
+                         f"（還有 {total-shown:,} 筆，按 [載入更多] 或捲到底自動載入）")
             else:
                 self.status_label.config(text=f"顯示全部 {total:,} 筆")
 
