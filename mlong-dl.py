@@ -453,10 +453,34 @@ def download_one(item: dict, output_dir: str, api_key: str, status_callback=None
     item_id = item['id']
     url = build_url(item_id, api_key)
 
-    # 組 output 檔名
+    # 組 output 檔名（v2.1：加 S/E prefix 讓影集好辨識）
     safe_name = re.sub(r'[\\/:*?"<>|]', '_', item['name'])[:200]
     year = item.get('year', '')
-    out_file = Path(output_dir) / f'{safe_name}{" ("+year+")" if year else ""}.mp4'
+
+    # 依 type 加 prefix
+    prefix = ''
+    if t == 'Episode':
+        series_name = item.get('series_name', '').strip()
+        season = _safe_int(item.get('season'), 1)
+        episode = _safe_int(item.get('episode'), 1)
+        if series_name:
+            # 「權力遊戲 - S01E05 「凱特」.mp4」格式
+            safe_series = re.sub(r'[\\/:*?"<>|]', '_', series_name)[:80]
+            prefix = f'{safe_series} - S{season:02d}E{episode:02d} '
+        else:
+            prefix = f'S{season:02d}E{episode:02d} '
+    elif t == 'Season':
+        season = _safe_int(item.get('season'), 1)
+        series_name = item.get('series_name', '').strip()
+        if series_name:
+            safe_series = re.sub(r'[\\/:*?"<>|]', '_', series_name)[:80]
+            prefix = f'{safe_series} - '
+        prefix += f'S{season:02d} '
+
+    filename = f'{prefix}{safe_name}'
+    if year and t == 'Movie':
+        filename += f' ({year})'
+    out_file = Path(output_dir) / f'{filename}.mp4'
 
     try:
         ytdlp_cmd = find_yt_dlp()
