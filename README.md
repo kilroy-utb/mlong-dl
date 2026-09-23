@@ -11,6 +11,7 @@
 - 📝 **可中斷續傳**：yt-dlp 自動 resume
 - 🌏 **繁簡搜尋**：你打繁體、DB 簡體也找得到（內建對照表）
 - ⚙ **記住設定**：config.json 存下載路徑/並發數/視窗大小
+- ⚡ **效能優化（v1.4.0）**：inverted index + filter cache + debounce 200ms，切快捷按鈕從 1500ms → 0ms
 
 ## 涵蓋內容（17 個萌龍雅軒 folder）
 
