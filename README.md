@@ -60,7 +60,25 @@ python3 mlong-dl.py update
 
 ## 日常使用
 
-### CLI — 搜尋並下載
+### 0. 快速開始（推薦） — 直接抓預建 DB
+
+```bash
+git clone https://github.com/kilroy-utb/mlong-dl.git
+cd mlong-dl
+bash setup.sh    # 安裝依賴 + 提示下載 db.json (28MB)
+export MLONG_API_KEY='190e8568de6f41f691012b7357572465'
+
+# 直接可用，不必跑 14 分鐘 update：
+python3 mlong-dl.py dl "阿凡達" -y
+python3 mlong-dl.py gui
+```
+
+預建 db.json 在 GitHub Release v1.2.0 (124,283 items):
+```
+https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json
+```
+
+### 1. CLI - 搜尋並下載
 ```bash
 # 模糊搜尋並下載第一個匹配
 python3 mlong-dl.py dl "阿凡達"
