@@ -1,0 +1,28 @@
+# 萌龍下載器 NAS 版 docker-compose
+# 用法：
+#   1. 把 mlong-dl.py + db.json + Dockerfile + 這檔 放到 NAS 一個資料夾
+#   2. 編輯 volumes 路徑 + API key
+#   3. docker compose up -d
+
+services:
+  mlong-dl:
+    build: .
+    container_name: mlong-dl
+    restart: unless-stopped
+    volumes:
+      # 下載目錄（NAS 通常是 /volume1/video 或 /share/Video 之類）
+      - /volume1/video/mlong-dl:/downloads
+      # 持久化 DB（重建 image 不會丟）
+      - ./db.json:/app/db.json
+      # 設定
+      - ./config.json:/app/config.json
+      # log
+      - ./logs:/app/logs
+    environment:
+      - MLONG_API_KEY=190e8568de6f41f691012b7357572465
+      # 如果 NAS 在中國/慢網，可以加：
+      # - http_proxy=http://192.168.1.1:7890
+      # - https_proxy=http://192.168.1.1:7890
+    # 如果 NAS 是 ARM（如 Synology DS220+），要 buildx：
+    # docker buildx build --platform linux/arm64 -t mlong-dl .
+    # 否則 x86_64 直接 docker compose up
