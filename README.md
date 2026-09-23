@@ -5,10 +5,12 @@
 ## 特色
 - 🎯 **名字 → 下載**：輸入電影中文名 → 自動查 Item ID → 自動抓完整檔案
 - 📦 **批量**：txt 清單一次抓多部
-- 🖥 **GUI**：雙擊選電影（基於 Tkinter，無額外依賴）
+- 🖥 **GUI 完整版**：4 個 tab (搜尋/瀏覽/佇列/設定) + 即時進度 + 批次佇列 + 取消
 - 💾 **本地 DB**：第一次同步 2047 部電影後，之後本地搜尋（不用每次打萌龍）
 - 🚀 **Range + multi-connection**：用 `yt-dlp` 直接抓 `original.mp4`，比 HLS 分段快 5-10 倍
 - 📝 **可中斷續傳**：yt-dlp 自動 resume
+- 🌏 **繁簡搜尋**：你打繁體、DB 簡體也找得到（內建對照表）
+- ⚙ **記住設定**：config.json 存下載路徑/並發數/視窗大小
 
 ## 安裝
 
@@ -81,8 +83,15 @@ python3 mlong-dl.py list
 ```bash
 python3 mlong-dl.py gui
 ```
-- 視窗 1:1 上方搜尋欄、中間 listbox、下方進度條
-- **雙擊電影 = 下載**
+- **4 個 tab**：
+  - 🔍 搜尋：輸入中文（繁/簡自動轉換）→ 即時過濾 → 雙擊下載或加入佇列
+  - 📚 瀏覽全部：類別 / 排序 / 多選批次
+  - ⏬ 佇列：即時進度條 + 速度 + ETA + 取消按鈕
+  - ⚙ 設定：下載路徑 / 並發數 / API Key / Server / Device ID（會存到 config.json）
+- **背景 thread**：下載不凍結 GUI
+- **可同時下載多部**（設並發數 1-8）
+- **取消按鈕**：用 subprocess.terminate 中斷 yt-dlp
+- **記住狀態**：視窗大小、上次搜尋自動保存
 
 ## 預設下載位置
 - macOS / Linux：`~/Downloads/mlong-dl/`
