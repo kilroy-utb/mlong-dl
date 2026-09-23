@@ -440,8 +440,69 @@ def find_yt_dlp():
     raise RuntimeError('找不到 yt-dlp，請先 pip install yt-dlp')
 
 
-def download_one(item: dict, output_dir: str, api_key: str, status_callback=None):
-    """用 yt-dlp 下載單個 item。api_key 必須傳入。"""
+def _parse_yt_dlp_progress(line: str):
+    """Parse yt-dlp --newline 進度行，回傳 (downloaded_bytes, total_bytes, speed_bps, eta_sec) 或 None。
+
+    範例行：
+      [download]  23.4% of   1.23GiB at 5.6MiB/s ETA 02:13
+      [download] 100% of   1.23GiB in 00:03:45 at 5.6MiB/s
+    """
+    if '[download]' not in line:
+        return None
+
+    def to_bytes(n, unit):
+        n = float(n)
+        u = unit.upper().replace('I', '')  # 'GiB' -> 'GB', 'MiB' -> 'MB'
+        mult = {'': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4,
+                'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4,
+                'KIB': 1024, 'MIB': 1024**2, 'GIB': 1024**3, 'TIB': 1024**4}[u]
+        return int(n * mult)
+
+    # 1) 切出 [download]  之後的段，避免後面的速度/sizes 干擾
+    m = re.search(r'\[download\]\s+(.*)', line)
+    seg = m.group(1) if m else line
+
+    # 2) 百分比
+    pct_m = re.search(r'(\d+(?:\.\d+)?)%', seg)
+    if not pct_m:
+        return None
+
+    # 3) "of  X.XxXB (at|in)" 之間的 size
+    #    yt-dlp 進度行： "[download]  23.4% of 1.23GiB at 5.6MiB/s ETA 02:13"
+    #    yt-dlp 完成行： "[download] 100% of 1.23GiB in 00:03:45 at 5.6MiB/s"
+    sizes_m = re.search(r'of\s+([\d.]+)\s*([KMGT]?i?B)\s+(?:at|in)\b', seg)
+    if sizes_m:
+        total = to_bytes(sizes_m.group(1), sizes_m.group(2))
+        # 用百分比算 downloaded（百分比是 ground truth）
+        downloaded = round(total * float(pct_m.group(1)) / 100)
+    else:
+        downloaded = 0
+        total = 0
+
+    # 4) speed（at X.XxXB/s）
+    speed_m = re.search(r'at\s+([\d.]+)\s*([KMGT]?i?B)/s', line)
+    speed = to_bytes(speed_m.group(1), speed_m.group(2)) if speed_m else 0
+
+    # 5) ETA 02:13 或 1:02:13
+    eta_m = re.search(r'ETA\s+(\d+):(\d{2})(?::(\d{2}))?', line)
+    if eta_m:
+        h = int(eta_m.group(3) or 0)
+        m_ = int(eta_m.group(1))
+        s = int(eta_m.group(2))
+        eta = h*3600 + m_*60 + s
+    else:
+        eta = 0
+
+    return (downloaded, total, speed, eta)
+
+
+def download_one(item: dict, output_dir: str, api_key: str,
+                 status_callback=None, progress_callback=None):
+    """用 yt-dlp 下載單個 item。api_key 必須傳入。
+
+    status_callback(text) — 文字狀態更新
+    progress_callback(downloaded_bytes, total_bytes, speed_bps, eta_sec) — 進度更新
+    """
     # Series 自己不能下載（沒 media），但可以自動展開成 episodes
     t = item.get('type', 'Movie')
     if t == 'Series':
@@ -503,12 +564,25 @@ def download_one(item: dict, output_dir: str, api_key: str, status_callback=None
         status_callback(f'下載中: {item["name"]}...')
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        last_total = 0  # 用於沒拿到 total 時 fallback
+        for line in proc.stdout:
+            line = line.rstrip()
+            parsed = _parse_yt_dlp_progress(line)
+            if parsed and progress_callback:
+                downloaded, total, speed, eta = parsed
+                if total > 0:
+                    last_total = total
+                progress_callback(downloaded, last_total, speed, eta)
+        proc.wait(timeout=3600)
         if proc.returncode == 0 and out_file.exists():
             return ('ok', str(out_file))
         else:
-            return ('error', f'rc={proc.returncode} stderr={proc.stderr[:200]}')
+            return ('error', f'rc={proc.returncode}')
     except subprocess.TimeoutExpired:
+        try: proc.kill()
+        except Exception: pass
         return ('error', 'timeout 1hr')
     except Exception as e:
         return ('error', str(e))
@@ -517,6 +591,113 @@ def download_one(item: dict, output_dir: str, api_key: str, status_callback=None
 def build_url(item_id: str, api_key: str) -> str:
     return (f'{DEFAULT_SERVER}/emby/videos/{item_id}/original.mp4'
             f'?DeviceId={DEFAULT_DEVICE_ID}&api_key={api_key}')
+
+
+# ═══════════════════════════════════════════════════════════
+# DownloadTracker — thread-safe 下載狀態 (背景 thread 寫 / GUI thread 讀)
+# ═══════════════════════════════════════════════════════════
+class _DownloadItem:
+    """單一下載任務的狀態。"""
+    __slots__ = ('id', 'name', 'kind', 'status', 'downloaded', 'total',
+                 'speed', 'eta', 'error')
+
+    def __init__(self, id_: str, name: str, kind: str):
+        self.id = id_
+        self.name = name
+        self.kind = kind           # Movie / Episode / Season
+        self.status = 'queued'     # queued / downloading / ok / error
+        self.downloaded = 0
+        self.total = 0
+        self.speed = 0
+        self.eta = 0
+        self.error = ''
+
+
+class DownloadTracker:
+    """所有下載任務的集合。背景 thread 透過 callback 寫入，GUI thread 定期 poll。
+
+    Thread-safety: 一把 lock 保護 _items。GUI 不該 mutate，只讀。
+    """
+
+    def __init__(self):
+        import threading as _th
+        self._lock = _th.Lock()
+        self._items = {}   # id -> _DownloadItem
+
+    # ── 寫入（背景 thread） ──────────────────────────────
+    def add(self, id_: str, name: str, kind: str) -> None:
+        with self._lock:
+            self._items[id_] = _DownloadItem(id_, name, kind)
+
+    def update_progress(self, id_: str, downloaded: int, total: int,
+                        speed: int, eta: int) -> None:
+        with self._lock:
+            it = self._items.get(id_)
+            if not it:
+                return
+            it.status = 'downloading'
+            it.downloaded = downloaded
+            if total > 0:
+                it.total = total
+            it.speed = speed
+            it.eta = eta
+
+    def mark_done(self, id_: str, ok: bool, error: str = '') -> None:
+        with self._lock:
+            it = self._items.get(id_)
+            if not it:
+                return
+            it.status = 'ok' if ok else 'error'
+            it.error = error
+            if ok and it.total > 0:
+                it.downloaded = it.total
+
+    # ── 讀取（GUI thread） ────────────────────────────────
+    def snapshot(self) -> list:
+        """回傳所有 items 的快照（淺拷貝 dict list）。"""
+        with self._lock:
+            return [
+                {
+                    'id': it.id, 'name': it.name, 'kind': it.kind,
+                    'status': it.status, 'downloaded': it.downloaded,
+                    'total': it.total, 'speed': it.speed, 'eta': it.eta,
+                    'error': it.error,
+                }
+                for it in self._items.values()
+            ]
+
+    def clear_finished(self) -> None:
+        """清掉 ok / error 的，留下進行中的。"""
+        with self._lock:
+            self._items = {k: v for k, v in self._items.items()
+                           if v.status == 'downloading' or v.status == 'queued'}
+
+
+# ── 格式化 helper ───────────────────────────────────────
+def _fmt_bytes(n: int) -> str:
+    if n <= 0:
+        return '0 B'
+    units = ['B','KB','MB','GB','TB']
+    i = 0
+    f = float(n)
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024
+        i += 1
+    return f'{f:.1f} {units[i]}'
+
+def _fmt_eta(sec: int) -> str:
+    if sec <= 0:
+        return ''
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f'{h}:{m:02d}:{s:02d}'
+    return f'{m}:{s:02d}'
+
+def _fmt_speed(bps: int) -> str:
+    if bps <= 0:
+        return ''
+    return f'{_fmt_bytes(bps)}/s'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -533,6 +714,9 @@ def run_gui(api_key: str):
     # v2.0 簡潔 GUI 結構
     db = MovieDB(DB_PATH)
     client = MlongClient(DEFAULT_SERVER, api_key)
+
+    # v2.2：下載進度追蹤（thread-safe，背景 thread 寫、GUI thread poll）
+    tracker = DownloadTracker()
 
     # ── 頂部：搜尋 bar + 按鈕列 ──────────────────────────
     top = ttk.Frame(root, padding=10)
@@ -566,7 +750,15 @@ def run_gui(api_key: str):
     ttk.Button(top, text='📁 ' + str(DOWNLOAD_DIR), command=lambda: open_download_dir()).pack(side='right')
 
     # ── 結果區 (lazy — 沒搜尋結果不顯示) ──────────────────────
-    result_frame = ttk.LabelFrame(root, text='搜尋結果', padding=5)
+    # ── Notebook 分頁：搜尋結果 / 下載進度 ────────────────
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill='both', expand=True, padx=10, pady=5)
+
+    # ── 分頁 1：搜尋結果 ─────────────────────────────────
+    search_page = ttk.Frame(notebook, padding=5)
+    notebook.add(search_page, text='🔍 搜尋結果')
+
+    result_frame = ttk.LabelFrame(search_page, text='搜尋結果', padding=5)
 
     result_listbox = tk.Listbox(result_frame, font=('TkFixedFont', 11), height=20)
     scrollbar = ttk.Scrollbar(result_frame, orient='vertical',
@@ -598,6 +790,88 @@ def run_gui(api_key: str):
         do_search.query = q
     do_search.results = []
     do_search.query = ''
+
+    # ── 分頁 2：下載進度 ─────────────────────────────────
+    progress_page = ttk.Frame(notebook, padding=5)
+    notebook.add(progress_page, text='📥 下載進度')
+
+    progress_toolbar = ttk.Frame(progress_page)
+    progress_toolbar.pack(fill='x', pady=(0, 5))
+    ttk.Button(progress_toolbar, text='🔄 清除已完成',
+               command=lambda: tracker.clear_finished()).pack(side='left', padx=2)
+    progress_summary = ttk.Label(progress_toolbar, text='')
+    progress_summary.pack(side='right', padx=5)
+
+    progress_tree_container = ttk.Frame(progress_page)
+    progress_tree_container.pack(fill='both', expand=True)
+
+    progress_tree = ttk.Treeview(progress_tree_container,
+                                 columns=('name', 'progress', 'size', 'speed', 'eta', 'status'),
+                                 show='headings', height=18)
+    progress_tree.heading('name', text='名稱')
+    progress_tree.heading('progress', text='進度')
+    progress_tree.heading('size', text='大小')
+    progress_tree.heading('speed', text='速度')
+    progress_tree.heading('eta', text='剩餘')
+    progress_tree.heading('status', text='狀態')
+    progress_tree.column('name', width=240, anchor='w')
+    progress_tree.column('progress', width=140, anchor='w')
+    progress_tree.column('size', width=140, anchor='e')
+    progress_tree.column('speed', width=90, anchor='e')
+    progress_tree.column('eta', width=70, anchor='e')
+    progress_tree.column('status', width=60, anchor='center')
+
+    prog_scroll = ttk.Scrollbar(progress_tree_container, orient='vertical',
+                                command=progress_tree.yview)
+    progress_tree.configure(yscrollcommand=prog_scroll.set)
+    progress_tree.pack(side='left', fill='both', expand=True)
+    prog_scroll.pack(side='right', fill='y')
+
+    # status 圖示
+    _STATUS_ICON = {'queued': '⏳', 'downloading': '⬇', 'ok': '✓', 'error': '✗'}
+
+    def _progress_bar_text(downloaded: int, total: int, width: int = 14) -> str:
+        if total <= 0:
+            return '░' * width + '  ?%'
+        ratio = max(0.0, min(1.0, downloaded / total))
+        filled = int(ratio * width)
+        return '▓' * filled + '░' * (width - filled) + f' {int(ratio * 100):3d}%'
+
+    def refresh_progress():
+        snap = tracker.snapshot()
+        # 只在 items 有變化時重建（避免每 0.5s flash）
+        existing = {progress_tree.set(iid, 'name'): iid for iid in progress_tree.get_children()}
+        new_iids = set()
+        for it in snap:
+            name = it['name']
+            iid = existing.get(name)
+            size_text = (f'{_fmt_bytes(it["downloaded"])} / {_fmt_bytes(it["total"])}'
+                         if it['total'] > 0 else f'{_fmt_bytes(it["downloaded"])} / ?')
+            row = (name,
+                   _progress_bar_text(it['downloaded'], it['total']),
+                   size_text,
+                   _fmt_speed(it['speed']),
+                   _fmt_eta(it['eta']),
+                   _STATUS_ICON.get(it['status'], ''))
+            if iid is None:
+                progress_tree.insert('', 'end', iid=name, values=row)
+            else:
+                progress_tree.item(iid, values=row)
+            new_iids.add(iid or name)
+        # 刪掉 tracker 已清除的
+        for iid in list(progress_tree.get_children()):
+            if progress_tree.set(iid, 'name') not in {it['name'] for it in snap}:
+                progress_tree.delete(iid)
+        # 摘要
+        n_total = len(snap)
+        n_active = sum(1 for it in snap if it['status'] == 'downloading')
+        n_done = sum(1 for it in snap if it['status'] == 'ok')
+        n_err = sum(1 for it in snap if it['status'] == 'error')
+        progress_summary.config(
+            text=f'總計 {n_total} · 下載中 {n_active} · 完成 {n_done} · 失敗 {n_err}')
+        root.after(500, refresh_progress)
+
+    refresh_progress()
 
     # 綁定 Enter 鍵和按鈕（在 do_search 定義後才能綁）
     entry.bind('<Return>', lambda e: do_search())
@@ -750,28 +1024,44 @@ def run_gui(api_key: str):
         dialog.protocol('WM_DELETE_WINDOW', on_dialog_close)
 
     def download_episodes_series(series, episodes):
+        # 切到進度頁
+        notebook.select(1)
         for i, ep in enumerate(episodes, 1):
             update_status(f'[{i}/{len(episodes)}] 下載: {ep["name"]}')
             result_listbox.selection_clear(0, 'end')
             result_listbox.selection_set(i - 1 if i - 1 < result_listbox.size() else 0)
             root.update_idletasks()
-            status, info = download_one(ep, str(DOWNLOAD_DIR), api_key)
+            tracker.add(ep['id'], ep['name'], ep.get('type', 'Episode'))
+            def _cb(d, t, s, e, _id=ep['id']):
+                tracker.update_progress(_id, d, t, s, e)
+            status, info = download_one(ep, str(DOWNLOAD_DIR), api_key,
+                                        progress_callback=_cb)
             if status == 'error':
+                tracker.mark_done(ep['id'], ok=False, error=str(info))
                 update_status(f'✗ {ep["name"]}: {info}')
                 messagebox.showerror('失敗', f'{ep["name"]}: {info}')
                 return
             elif status == 'ok':
+                tracker.mark_done(ep['id'], ok=True)
                 update_status(f'✓ {i}/{len(episodes)} {ep["name"]} 完成')
             root.update_idletasks()
         update_status(f'✓✓✓ {series["name"]} 全部 {len(episodes)} 集完成！')
         messagebox.showinfo('完成', f'下載完成：{len(episodes)} 集')
 
     def download_one_thread(item):
-        status, info = download_one(item, str(DOWNLOAD_DIR), api_key)
+        # 切到進度頁
+        notebook.select(1)
+        tracker.add(item['id'], item['name'], item.get('type', 'Movie'))
+        def _cb(d, t, s, e, _id=item['id']):
+            tracker.update_progress(_id, d, t, s, e)
+        status, info = download_one(item, str(DOWNLOAD_DIR), api_key,
+                                    progress_callback=_cb)
         if status == 'error':
+            tracker.mark_done(item['id'], ok=False, error=str(info))
             update_status(f'✗ {item["name"]}: {info}')
             messagebox.showerror('失敗', f'{item["name"]}: {info}')
         elif status == 'ok':
+            tracker.mark_done(item['id'], ok=True)
             update_status(f'✓ {item["name"]} → {info}')
 
     # ── 更新 DB ────────────────────────────────────────────
