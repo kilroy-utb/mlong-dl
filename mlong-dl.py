@@ -302,16 +302,42 @@ class MovieDB:
         series = self._by_id.get(series_id)
         if not series:
             return {series_id}
-        sname = series['name']
         ids = {series_id}
+        sname = series['name']
         for m in self.movies:
-            # series 自己
             if m['id'] == series_id:
                 ids.add(m['id'])
-            # 任何 season / episode 屬於這個 series
-            if m.get('series_name') == sname:
+            elif m.get('series_name') == sname:
                 ids.add(m['id'])
         return ids
+
+    def find_series_for_episode(self, episode_id: str):
+        """v2.4：給定 episode id，找出 parent Series item（用 series_name 反查）。
+        回傳 None 表示找不到（可能 DB 沒該 episode、或 series 已被砍）。
+        """
+        ep = self._by_id.get(episode_id)
+        if not ep:
+            return None
+        if ep.get('type') == 'Series':
+            return ep
+        sname = ep.get('series_name', '')
+        if not sname:
+            return None
+        for m in self.movies:
+            if m.get('type') == 'Series' and m.get('name') == sname:
+                return m
+        return None
+
+    def find_parent_id_for_movie(self, movie_id: str):
+        """v2.4：給定 movie id，找出它在萌龍的 folder ParentId。
+        用 item.folder 反查 KNOWN_FOLDERS 對應的 parent_id。
+        """
+        m = self._by_id.get(movie_id)
+        if not m:
+            return None, None
+        folder = m.get('folder', '')
+        parent_id = KNOWN_FOLDERS.get(folder)
+        return parent_id, folder
 
 
 # ═══════════════════════════════════════════════════════════
@@ -373,6 +399,7 @@ class MlongClient:
                     'year': year,
                     'folder': label,
                     'type': t,
+                    'parent_id': str(it.get('ParentId', '')) if it.get('ParentId') is not None else '',
                     'season': it.get('ParentIndexNumber') if t == 'Episode' else it.get('IndexNumber'),
                     'episode': it.get('IndexNumber') if t == 'Episode' else None,
                     'series_name': it.get('SeriesName', ''),
@@ -423,6 +450,7 @@ class MlongClient:
                 'year': year,
                 'folder': label,
                 'type': t,
+                'parent_id': str(it.get('ParentId', '')) if it.get('ParentId') is not None else '',
                 'season': it.get('ParentIndexNumber') if t == 'Episode' else it.get('IndexNumber'),
                 'episode': it.get('IndexNumber') if t == 'Episode' else None,
                 'series_name': it.get('SeriesName', '') or sname,
@@ -798,8 +826,9 @@ def run_gui(api_key: str):
     result_listbox.pack(side='left', fill='both', expand=True)
     scrollbar.pack(side='right', fill='y')
 
-    # 雙擊 = 下載
+    # 雙擊 = 下載 / 右鍵 = popup menu
     result_listbox.bind('<Double-Button-1>', lambda e: on_download_selected())
+    result_listbox.bind('<Button-3>', lambda e: on_right_click(e))
 
 # v2.0 修：do_search 必須在使用前定義（Python nested function late-binding）
     def do_search():
@@ -1196,6 +1225,129 @@ def run_gui(api_key: str):
             return
         threading.Thread(target=run_update_single,
                         args=(item['id'],), daemon=True).start()
+
+    # ── v2.4 右鍵 menu handlers ────────────────────────────
+    def update_item_from_right_click(item):
+        """右鍵「更新」：依 item.type 重抓
+        - Series:        get_series_full_tree
+        - Episode/Season: 找 parent series → get_series_full_tree
+        - Movie:         重抓整個 folder
+        """
+        t = item.get('type', 'Movie')
+        if t == 'Series':
+            label = item.get('folder', '')
+            if not messagebox.askyesno('確認更新',
+                f'重抓 series「{item["name"]}」({item["id"]}) 整個 tree？\n\n'
+                f'會替換 DB 裡這個 series 的 seasons + episodes。'):
+                return
+            threading.Thread(target=run_update_single,
+                            args=(item['id'],), daemon=True).start()
+        elif t in ('Episode', 'Season'):
+            parent = db.find_series_for_episode(item['id'])
+            if not parent:
+                messagebox.showerror('錯誤', f'找不到 episode 的 parent series\n'
+                                       f'（DB 裡 series「{item.get("series_name","?")}」不存在）')
+                return
+            if not messagebox.askyesno('確認更新',
+                f'從 episode「{item["name"]}」找到 parent series「{parent["name"]}」\n\n'
+                f'重抓整個 series tree？這會替換所有 seasons + episodes。'):
+                return
+            threading.Thread(target=run_update_single,
+                            args=(parent['id'],), daemon=True).start()
+        elif t == 'Movie':
+            parent_id, folder = db.find_parent_id_for_movie(item['id'])
+            if not parent_id:
+                messagebox.showerror('錯誤',
+                    f'找不到 movie 對應的 folder\n'
+                    f'（item.folder={folder or "?"} 不在 KNOWN_FOLDERS）')
+                return
+            if not messagebox.askyesno('確認更新',
+                f'重抓整個 folder「{folder}」(ParentId={parent_id})？\n\n'
+                f'⚠️ 這會用萌龍最新資料「整個替換」folder 內所有 movie。'):
+                return
+            threading.Thread(target=run_update_folder,
+                            args=(folder, parent_id), daemon=True).start()
+        else:
+            messagebox.showinfo('提示', f'type={t} 不支援右鍵更新')
+
+    def run_update_folder(folder_label, parent_id):
+        try:
+            update_status(f'重抓 folder {folder_label} (ParentId={parent_id})...')
+            include_types = FOLDER_TYPES.get(folder_label, ['Movie'])
+            new_items = client.list_folder(parent_id, folder_label, include_types=include_types)
+            seen = {it['id'] for it in new_items}
+            # 用 folder 標籤當 filter key
+            before = len(db.movies)
+            db.movies = [m for m in db.movies if m.get('folder') != folder_label]
+            after_remove = len(db.movies)
+            update_status(f'移除 {before - after_remove} 筆舊 {folder_label} entry')
+            added = 0
+            for it in new_items:
+                db.movies.append(it)
+                added += 1
+            db.save()
+            db._build_indexes()
+            update_status(f'✓ folder {folder_label} 更新完成（{added} 筆）')
+            messagebox.showinfo('完成', f'folder「{folder_label}」更新完成：{added} 筆')
+        except Exception as e:
+            update_status(f'✗ 更新失敗: {e}')
+            messagebox.showerror('失敗', str(e))
+
+    def copy_id_to_clipboard(item):
+        root.clipboard_clear()
+        root.clipboard_append(item['id'])
+        update_status(f'已複製 ID：{item["id"]}')
+
+    def expand_series_dialog_from_right(item):
+        """對 Series 開 Detail Dialog（雙擊效果）"""
+        if item.get('type') != 'Series':
+            messagebox.showinfo('提示', '只有 series 可以展開')
+            return
+        episodes = db.get_episodes_for_series(item['id'])
+        if not episodes:
+            messagebox.showinfo('提示', '這個 series 沒有 episodes（DB 沒資料）')
+            return
+        open_series_detail_dialog(item, episodes)
+
+    def download_from_right(item):
+        """對 Movie/Episode 直接下載，Series 走 dialog"""
+        if item.get('type') == 'Series':
+            expand_series_dialog_from_right(item)
+        else:
+            threading.Thread(target=download_one_thread,
+                           args=(item,), daemon=True).start()
+
+    def on_right_click(event):
+        # 找出點到哪個 row
+        idx = result_listbox.nearest(event.y)
+        if idx < 0:
+            return
+        # 先選起來
+        result_listbox.selection_clear(0, 'end')
+        result_listbox.selection_set(idx)
+        result_listbox.activate(idx)
+        if idx >= len(do_search.results):
+            return
+        item = do_search.results[idx]
+
+        menu = tk.Menu(root, tearoff=0)
+        t = item.get('type', 'Movie')
+        menu.add_command(label='📥 下載',
+                         command=lambda: download_from_right(item))
+        if t == 'Series':
+            menu.add_command(label='🔍 展開 episodes',
+                             command=lambda: expand_series_dialog_from_right(item))
+        menu.add_command(label='🔄 更新該 episodes list',
+                         command=lambda: update_item_from_right_click(item))
+        menu.add_separator()
+        menu.add_command(label='📋 複製 ID',
+                         command=lambda: copy_id_to_clipboard(item))
+        menu.add_command(label=f'ℹ️ 類型：{t} · folder：{item.get("folder","?")}',
+                         state='disabled')
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     # ── 開下載資料夾 ──────────────────────────────────────
     def open_download_dir():
