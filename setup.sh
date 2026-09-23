@@ -2,7 +2,10 @@
 # 萌龍下載器 setup 腳本（macOS / Linux）
 # 用法：bash setup.sh
 
-set -e
+# 不要 set -e，我們要一步一步 debug
+set +e
+
+trap 'echo "  [exit trap] line=$LINENO exit=$?"' ERR
 
 echo "╔══════════════════════════════════════╗"
 echo "║  萌龍下載器 mlong-dl 安裝              ║"
@@ -94,26 +97,49 @@ if [[ "$DL" =~ ^[Yy]$ ]]; then
         echo "▶ 下載 db.json.gz (3.5 MB)..."
         echo "  CWD: $(pwd)"
         echo "  PY: $PY"
-        # 移除舊檔
-        rm -f db.json.gz db.json
-        # 不用 --progress-bar (Git Bash 上可能怪)，改用普通 -L
-        curl -L -o db.json.gz "$DB_URL"
-        CURL_EXIT=$?
-        echo "  curl exit code: $CURL_EXIT"
-        echo "  db.json.gz size: $(ls -l db.json.gz 2>/dev/null | awk '{print $5}') bytes"
-        echo "  db.json.gz exists? $([[ -f db.json.gz ]] && echo yes || echo no)"
 
-        if [[ ! -s db.json.gz ]]; then
-            echo "✗ db.json.gz 下載失敗或為空"
-            echo "  試手動: 直接瀏覽器下載 https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
+        # 改成絕對路徑，避免 CWD 不一致
+        TARGET_DIR="$(pwd)"
+        DB_GZ="$TARGET_DIR/db.json.gz"
+        DB="$TARGET_DIR/db.json"
+
+        rm -f "$DB_GZ" "$DB"
+
+        echo "  Target: $DB_GZ"
+        echo "  curl start..."
+
+        # 不用 --progress-bar (Git Bash 上可能怪)，改用普通 -L
+        curl -L -o "$DB_GZ" "$DB_URL"
+        CURL_EXIT=$?
+
+        echo "  curl done, exit=$CURL_EXIT"
+
+        if [[ -f "$DB_GZ" ]]; then
+            GZ_SIZE=$(stat -c%s "$DB_GZ" 2>/dev/null || stat -f%z "$DB_GZ" 2>/dev/null)
+            echo "  db.json.gz exists, size=$GZ_SIZE bytes"
         else
+            echo "  db.json.gz NOT EXISTS"
+        fi
+
+        if [[ ! -s "$DB_GZ" ]]; then
+            echo "✗ db.json.gz 下載失敗或為空"
+            echo "  試手動: 瀏覽器下載 https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
+            echo "  放到 $TARGET_DIR/ 然後按 Enter"
+            read
+            if [[ ! -s "$DB_GZ" ]]; then
+                echo "✗ 還是沒有 db.json.gz，跳過解壓"
+            fi
+        fi
+
+        if [[ -s "$DB_GZ" ]]; then
             echo "▶ 用 $PY 解壓..."
-            "$PY" -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))"
+            "$PY" -c "import gzip; open('$DB','wb').write(gzip.decompress(open('$DB_GZ','rb').read()))"
             PY_EXIT=$?
-            echo "  解壓 exit code: $PY_EXIT"
-            rm db.json.gz
-            if [[ -s db.json ]]; then
-                echo "✓ db.json 解壓完成（$(wc -c < db.json) bytes）"
+            echo "  python exit=$PY_EXIT"
+            rm -f "$DB_GZ"
+            if [[ -s "$DB" ]]; then
+                DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || stat -f%z "$DB" 2>/dev/null)
+                echo "✓ db.json 解壓完成（$DB_SIZE bytes）"
             else
                 echo "✗ 解壓失敗"
             fi
