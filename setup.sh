@@ -78,19 +78,47 @@ echo ""
 read -p "要下載嗎？[y/N]: " DL
 if [[ "$DL" =~ ^[Yy]$ ]]; then
     DB_URL="https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
-    echo "▶ 下載 db.json.gz (3.5 MB)..."
-    if command -v curl &> /dev/null; then
-        curl -L --progress-bar -o db.json.gz "$DB_URL" && \
-            python3 -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))" && \
-            rm db.json.gz && \
-            echo "✓ db.json 下載並解壓完成"
-    elif command -v wget &> /dev/null; then
-        wget -O db.json.gz "$DB_URL" && \
-            python3 -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))" && \
-            rm db.json.gz && \
-            echo "✓ db.json 下載並解壓完成"
+
+    # 偵測 python 命令（Windows 用 python，Linux/macOS 用 python3）
+    if command -v python3 &> /dev/null; then
+        PY=python3
+    elif command -v python &> /dev/null; then
+        PY=python
     else
-        echo "✗ 找不到 curl 或 wget"
+        PY=""
+    fi
+
+    if [[ -z "$PY" ]]; then
+        echo "✗ 找不到 python，請手動下載 + 解壓"
+    else
+        echo "▶ 下載 db.json.gz (3.5 MB)..."
+        if command -v curl &> /dev/null; then
+            curl -L --progress-bar -o db.json.gz "$DB_URL"
+            if [[ -s db.json.gz ]] && file db.json.gz 2>/dev/null | grep -q gzip; then
+                echo "▶ 用 $PY 解壓..."
+                "$PY" -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))"
+                rm db.json.gz
+                if [[ -s db.json ]]; then
+                    echo "✓ db.json 解壓完成（$(wc -c < db.json) bytes）"
+                else
+                    echo "✗ 解壓後 db.json 是空的"
+                fi
+            else
+                echo "✗ db.json.gz 下載失敗或不是 gzip 格式"
+                ls -lh db.json.gz
+            fi
+        elif command -v wget &> /dev/null; then
+            wget -O db.json.gz "$DB_URL"
+            if [[ -s db.json.gz ]] && file db.json.gz 2>/dev/null | grep -q gzip; then
+                "$PY" -c "import gzip; open('db.json','wb').write(gzip.decompress(open('db.json.gz','rb').read()))"
+                rm db.json.gz
+                echo "✓ db.json 解壓完成（$(wc -c < db.json) bytes）"
+            else
+                echo "✗ db.json.gz 下載失敗"
+            fi
+        else
+            echo "✗ 找不到 curl 或 wget"
+        fi
     fi
 fi
 
