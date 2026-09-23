@@ -489,6 +489,60 @@ class MlongClient:
             all_eps.extend(eps)
         return all_eps
 
+    def get_series_full_tree(self, series_id: str, label: str = '') -> list:
+        """v1.5.1：拿整個 series 樹（Series + 所有 Seasons + 所有 Episodes）。
+        回傳格式同 list_folder_all 產生的格式，可直接寫入 db.movies。
+        """
+        items = []
+
+        # 1. Series 自己（萌龍擋 /Items/{id}，用 ?Ids= 取）
+        r = self.s.get(self._url('/Items'), params={
+            'api_key': self.api_key,
+            'Ids': series_id,
+        })
+        if r.status_code != 200:
+            raise RuntimeError(f"GET Items?Ids={series_id} failed: {r.status_code}")
+        results = r.json().get('Items', [])
+        if not results:
+            raise RuntimeError(f"Series {series_id} 不存在或無權限")
+        series_item = results[0]
+        series_name = series_item.get('Name', '')
+
+        # 2. Seasons + Episodes（recursive）
+        params = {
+            'api_key': self.api_key,
+            'ParentId': series_id,
+            'Recursive': 'true',
+            'Fields': 'Name,ProductionYear,RunTimeTicks,Type,'
+                      'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,Overview,ParentId',
+        }
+        r = self.s.get(self._url('/Items'), params=params)
+        r.raise_for_status()
+        children = r.json().get('Items', [])
+
+        # 3. 組合 + 轉格式
+        all_raw = [series_item] + children
+
+        for it in all_raw:
+            t = it.get('Type', '')
+            name = it.get('Name', '')
+            year = ''
+            m = re.search(r'\((\d{4})\)', name)
+            if m:
+                year = m.group(1)
+            items.append({
+                'id': str(it.get('Id')),
+                'name': name,
+                'year': year,
+                'folder': label,
+                'type': t,
+                'season': it.get('ParentIndexNumber') if t == 'Episode' else it.get('IndexNumber'),
+                'episode': it.get('IndexNumber') if t == 'Episode' else None,
+                'series_name': it.get('SeriesName', '') or series_name,
+                'runtime_ticks': it.get('RunTimeTicks', 0),
+            })
+        return items
+
     def build_original_url(self, item_id: str) -> str:
         """拼 original.mp4 URL。萌龍雅軒不需要 MediaSourceId/PlaySessionId。"""
         return (f"{self.server}/emby/videos/{item_id}/original.mp4"
@@ -552,6 +606,10 @@ def download_with_ytdlp(url: str, output_path: Path, title_hint: str = "") -> bo
 # ── 業務邏輯 ─────────────────────────────────────────────────
 def cmd_update(args, client: MlongClient, db: MovieDB):
     """從萌龍同步所有電影到本地 DB。"""
+    # v1.5.1: 支援只更新單個 series
+    if getattr(args, 'series_id', None):
+        return _update_single_series(args.series_id, client, db)
+
     print("▶ 從萌龍雅軒同步電影清單...")
     client.ping()
 
@@ -576,6 +634,71 @@ def cmd_update(args, client: MlongClient, db: MovieDB):
     db.movies = unique
     db.save()
     print(f"\n✓ DB 更新完成：{len(unique)} 部電影 → {db.path}")
+
+
+def _update_single_series(series_id: str, client: MlongClient, db: MovieDB):
+    """v1.5.1：只更新某個 series，不重抓全部。"""
+    if not db.movies:
+        print("✗ DB 是空的，請先跑 `update`")
+        return
+
+    # 找現有 entry 知道 folder
+    existing = db.get(series_id)
+    if not existing:
+        print(f"⚠ DB 沒有 series_id={series_id}，跑 `update` 先建 DB")
+        # 但還是 fetch 一次給使用者看
+        try:
+            items = client.get_series_full_tree(series_id)
+            print(f"  萌龍上找到 {len(items)} 筆（Series + Seasons + Episodes）")
+            for it in items[:5]:
+                print(f"    [{it['id']}] {it['type']:8s} {it['name']}")
+        except Exception as e:
+            print(f"  ✗ 從萌龍 fetch 也失敗：{e}")
+        return
+
+    label = existing.get('folder', '')
+    sname = existing.get('name', f'series_{series_id}')
+    print(f"▶ 更新 series「{sname}」({series_id}) [folder={label}]")
+    print(f"  從萌龍 fetch...")
+
+    try:
+        new_items = client.get_series_full_tree(series_id, label=label)
+    except Exception as e:
+        print(f"  ✗ fetch 失敗：{e}")
+        return
+    print(f"  ✓ fetch 到 {len(new_items)} 筆")
+
+    # 移除舊 entry：所有跟這個 series 有關的（series 自己 + 所有 descendants）
+    # 從 db.movies 找出所有 parent chain = series_id 或 season_under_series 的
+    series_descendant_ids = {series_id}
+    for m in db.movies:
+        # 從 Season/Episode 反查（它們的 ParentId 邏輯上會在 Series 樹下）
+        # 但 db 存的沒有 ParentId，只有 season/episode 編號
+        # 所以我們靠「series_name 對應」+「同 folder」
+        if m.get('folder') == label and m.get('series_name') == sname:
+            series_descendant_ids.add(m['id'])
+
+    before_count = len(db.movies)
+    db.movies = [m for m in db.movies if m['id'] not in series_descendant_ids]
+    after_remove = len(db.movies)
+    print(f"  移除 {before_count - after_remove} 筆舊 entry")
+
+    # 加新 entry
+    added_count = 0
+    seen = {m['id'] for m in db.movies}
+    for it in new_items:
+        if it['id'] not in seen:
+            db.movies.append(it)
+            seen.add(it['id'])
+            added_count += 1
+    print(f"  加入 {added_count} 筆新 entry")
+
+    db.save()
+    print(f"\n✓ DB 已存 ({len(db.movies):,} 筆)")
+
+    # 重新建 index
+    print("  重建 in-memory index...")
+    db._build_indexes()
 
 
 def cmd_search(args, client: MlongClient, db: MovieDB):
@@ -1743,6 +1866,8 @@ def main():
 
     # update
     p_update = sub.add_parser('update', help='從萌龍同步電影清單到本地 DB')
+    p_update.add_argument('--series', dest='series_id', metavar='SERIES_ID',
+                          help='只更新某個 series（不重抓全部，秒完成）')
     p_update.set_defaults(func=cmd_update)
 
     # query 搜尋
