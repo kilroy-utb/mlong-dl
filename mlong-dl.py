@@ -563,21 +563,26 @@ class DownloadWorker:
         base = re.sub(r'[\\/:*?"<>|]', '_', m['name'])[:200]
         year = m.get('year', '')
 
+        def _to_int(v, default=1):
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return default
+
         if t == 'Series':
-            # 不實際下載（Series 沒 media source），但保留格式一致
             return self.output_dir / f"{base}{' ('+year+')' if year else ''}.mp4"
         elif t == 'Season':
-            sn = m.get('season') or 1
+            sn = _to_int(m.get('season'), 1)
             series = m.get('series_name') or base
             series_safe = re.sub(r'[\\/:*?"<>|]', '_', series)[:100]
-            return self.output_dir / f"{series_safe} - S{int(sn):02d}.mp4"
+            return self.output_dir / f"{series_safe} - S{sn:02d}.mp4"
         elif t == 'Episode':
-            sn = m.get('season') or 1
-            ep = m.get('episode') or 1
+            sn = _to_int(m.get('season'), 1)
+            ep = _to_int(m.get('episode'), 1)
             series = m.get('series_name') or base
             series_safe = re.sub(r'[\\/:*?"<>|]', '_', series)[:100]
             ep_safe = re.sub(r'[\\/:*?"<>|]', '_', base)[:100]
-            return self.output_dir / f"{series_safe} - S{int(sn):02d}E{int(ep):02d} 「{ep_safe}」.mp4"
+            return self.output_dir / f"{series_safe} - S{sn:02d}E{ep:02d} 「{ep_safe}」.mp4"
         else:
             return self.output_dir / f"{base}{' ('+year+')' if year else ''}.mp4"
 
@@ -819,6 +824,13 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self._refresh_search_list()
             self.status_label.config(text=f"篩選 {quick}/{t} → {len(self.search_results):,} 筆")
 
+        def _safe_int(value, default=0):
+            """轉 int，失敗回傳 default。"""
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return default
+
         def _format_item(self, m):
             """格式化一個 item 給 listbox 顯示。
             Movie:        [   51465] 🎬 阿凡达 (2009) [179分]
@@ -849,13 +861,13 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             elif t == 'Series':
                 return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
             elif t == 'Season':
-                sn = m.get('season') or '?'
-                return f"[{m['id']:>10}] {emoji} {m.get('series_name', '?')} - S{int(sn):02d}"
+                sn = self._safe_int(m.get('season'))
+                return f"[{m['id']:>10}] {emoji} {m.get('series_name', '?')} - S{sn:02d}"
             elif t == 'Episode':
-                sn = m.get('season') or '?'
-                ep = m.get('episode') or '?'
+                sn = self._safe_int(m.get('season'))
+                ep = self._safe_int(m.get('episode'))
                 series = m.get('series_name') or ''
-                return f"[{m['id']:>10}] {emoji} {series} S{int(sn):02d}E{int(ep):02d} 「{m['name']}」{runtime}"
+                return f"[{m['id']:>10}] {emoji} {series} S{sn:02d}E{ep:02d} 「{m['name']}」{runtime}"
             else:
                 return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
 
