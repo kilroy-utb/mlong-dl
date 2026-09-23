@@ -543,11 +543,13 @@ def _parse_yt_dlp_progress(line: str):
 
 
 def download_one(item: dict, output_dir: str, api_key: str,
-                 status_callback=None, progress_callback=None):
+                 status_callback=None, progress_callback=None,
+                 tracker=None):
     """用 yt-dlp 下載單個 item。api_key 必須傳入。
 
     status_callback(text) — 文字狀態更新
     progress_callback(downloaded_bytes, total_bytes, speed_bps, eta_sec) — 進度更新
+    tracker — optional DownloadTracker，傳入時會註冊 proc 以支援 cancel()
     """
     # Series 自己不能下載（沒 media），但可以自動展開成 episodes
     t = item.get('type', 'Movie')
@@ -614,6 +616,9 @@ def download_one(item: dict, output_dir: str, api_key: str,
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
+        # 註冊給 tracker，cancel() 可 kill
+        if tracker is not None:
+            tracker.register_proc(item_id, proc)
         last_total = 0  # 用於沒拿到 total 時 fallback
         with open(debug_log, 'a', encoding='utf-8') as df:
             df.write(f'\n=== {item["name"]} ({item_id}) ===\n')
@@ -627,6 +632,14 @@ def download_one(item: dict, output_dir: str, api_key: str,
                         last_total = total
                     progress_callback(downloaded, last_total, speed, eta)
         proc.wait(timeout=3600)
+        if tracker is not None:
+            tracker.unregister_proc(item_id)
+        # 查 tracker flag → 判斷是 cancel 還是 error
+        if tracker is not None and tracker.was_cancelled(item_id):
+            return ('cancelled', '使用者停止')
+        # 負 returncode 表示被 signal 殺掉（POSIX cancel 的另一條路徑）
+        if proc.returncode is not None and proc.returncode < 0:
+            return ('cancelled', f'rc={proc.returncode}')
         if proc.returncode == 0 and out_file.exists():
             return ('ok', str(out_file))
         else:
@@ -634,8 +647,12 @@ def download_one(item: dict, output_dir: str, api_key: str,
     except subprocess.TimeoutExpired:
         try: proc.kill()
         except Exception: pass
+        if tracker is not None:
+            tracker.unregister_proc(item_id)
         return ('error', 'timeout 1hr')
     except Exception as e:
+        if tracker is not None:
+            tracker.unregister_proc(item_id)
         return ('error', str(e))
 
 
@@ -657,7 +674,7 @@ class _DownloadItem:
         self.name = name
         self.kind = kind           # Movie / Episode / Season
         self.path = path           # 下載到哪個資料夾（顯示用）
-        self.status = 'queued'     # queued / downloading / ok / error
+        self.status = 'queued'     # queued / downloading / ok / error / cancelled
         self.downloaded = 0
         self.total = 0
         self.speed = 0
@@ -668,18 +685,30 @@ class _DownloadItem:
 class DownloadTracker:
     """所有下載任務的集合。背景 thread 透過 callback 寫入，GUI thread 定期 poll。
 
-    Thread-safety: 一把 lock 保護 _items。GUI 不該 mutate，只讀。
+    Thread-safety: 一把 lock 保護 _items 跟 _procs。GUI 不該 mutate，只讀。
     """
 
     def __init__(self):
         import threading as _th
         self._lock = _th.Lock()
-        self._items = {}   # id -> _DownloadItem
+        self._items = {}    # id -> _DownloadItem
+        self._procs = {}    # id -> subprocess.Popen（背景 thread 註冊 / 移除）
+        self._cancelled = set()  # id set，被 cancel() 標記，背景 thread 醒來查這個
 
     # ── 寫入（背景 thread） ──────────────────────────────
     def add(self, id_: str, name: str, kind: str, path: str = '') -> None:
         with self._lock:
             self._items[id_] = _DownloadItem(id_, name, kind, path)
+
+    def register_proc(self, id_: str, proc) -> None:
+        """背景 thread 在 Popen 完後註冊 proc，給 cancel() 用。"""
+        with self._lock:
+            self._procs[id_] = proc
+
+    def unregister_proc(self, id_: str) -> None:
+        """下載結束（成功/失敗/cancel）後移除 proc 參照。"""
+        with self._lock:
+            self._procs.pop(id_, None)
 
     def update_progress(self, id_: str, downloaded: int, total: int,
                         speed: int, eta: int) -> None:
@@ -704,6 +733,19 @@ class DownloadTracker:
             if ok and it.total > 0:
                 it.downloaded = it.total
 
+    def mark_cancelled(self, id_: str) -> None:
+        with self._lock:
+            it = self._items.get(id_)
+            if not it:
+                return
+            it.status = 'cancelled'
+            it.error = '使用者停止'
+
+    def was_cancelled(self, id_: str) -> bool:
+        """背景 thread 查詢：是否被使用者 cancel。"""
+        with self._lock:
+            return id_ in self._cancelled
+
     # ── 讀取（GUI thread） ────────────────────────────────
     def snapshot(self) -> list:
         """回傳所有 items 的快照（淺拷貝 dict list）。"""
@@ -719,10 +761,37 @@ class DownloadTracker:
             ]
 
     def clear_finished(self) -> None:
-        """清掉 ok / error 的，留下進行中的。"""
+        """清掉 ok / error / cancelled 的，留下進行中的。"""
         with self._lock:
             self._items = {k: v for k, v in self._items.items()
-                           if v.status == 'downloading' or v.status == 'queued'}
+                           if v.status in ('downloading', 'queued')}
+
+    # ── 控制（GUI thread 呼叫） ──────────────────────────
+    def cancel(self, id_: str) -> bool:
+        """Kill 對應的 subprocess（如果還活著）。回傳 True 表示有東西被殺。
+
+        標記 _cancelled[id] 給背景 thread 醒來時查詢。
+        """
+        import subprocess as _sp
+        with self._lock:
+            proc = self._procs.get(id_)
+            self._cancelled.add(id_)
+        if proc is None:
+            return False
+        try:
+            if sys.platform == 'win32':
+                # Windows 用 taskkill /F /T 砍整個 process tree（yt-dlp 可能 spawn ffmpeg 子進程）
+                _sp.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                       capture_output=True)
+            else:
+                proc.terminate()  # SIGTERM → yt-dlp 收到會 clean shutdown
+                try:
+                    proc.wait(timeout=5)
+                except _sp.TimeoutExpired:
+                    proc.kill()    # SIGKILL
+            return True
+        except Exception:
+            return False
 
 
 # ── 格式化 helper ───────────────────────────────────────
@@ -859,6 +928,8 @@ def run_gui(api_key: str):
     progress_toolbar.pack(fill='x', pady=(0, 5))
     ttk.Button(progress_toolbar, text='🔄 清除已完成',
                command=lambda: tracker.clear_finished()).pack(side='left', padx=2)
+    ttk.Button(progress_toolbar, text='✕ 停止選中',
+               command=lambda: cancel_selected()).pack(side='left', padx=2)
     progress_summary = ttk.Label(progress_toolbar, text='')
     progress_summary.pack(side='right', padx=5)
 
@@ -890,7 +961,7 @@ def run_gui(api_key: str):
     prog_scroll.pack(side='right', fill='y')
 
     # status 圖示
-    _STATUS_ICON = {'queued': '⏳', 'downloading': '⬇', 'ok': '✓', 'error': '✗'}
+    _STATUS_ICON = {'queued': '⏳', 'downloading': '⬇', 'ok': '✓', 'error': '✗', 'cancelled': '⏹'}
 
     def _progress_bar_text(downloaded: int, total: int, width: int = 14) -> str:
         if total <= 0:
@@ -934,11 +1005,73 @@ def run_gui(api_key: str):
         n_active = sum(1 for it in snap if it['status'] == 'downloading')
         n_done = sum(1 for it in snap if it['status'] == 'ok')
         n_err = sum(1 for it in snap if it['status'] == 'error')
+        n_cancel = sum(1 for it in snap if it['status'] == 'cancelled')
         progress_summary.config(
-            text=f'總計 {n_total} · 下載中 {n_active} · 完成 {n_done} · 失敗 {n_err}')
+            text=f'總計 {n_total} · 下載中 {n_active} · 完成 {n_done} · 失敗 {n_err} · 取消 {n_cancel}')
         root.after(500, refresh_progress)
 
     refresh_progress()
+
+    def cancel_selected():
+        sel = progress_tree.selection()
+        if not sel:
+            messagebox.showinfo('提示', '請先在進度頁選一個 row')
+            return
+        iid = sel[0]
+        # 從 iid (name) 找對應 tracker item id
+        snap = tracker.snapshot()
+        name_to_id = {it['name']: it['id'] for it in snap}
+        item_id = name_to_id.get(iid)
+        if not item_id:
+            messagebox.showinfo('提示', '找不到對應的下載 task')
+            return
+        # 找出狀態
+        target = next((it for it in snap if it['id'] == item_id), None)
+        if target and target['status'] in ('ok', 'error', 'cancelled'):
+            messagebox.showinfo('提示', f'{target["name"]} 已經 {target["status"]}，不用停止')
+            return
+        if not messagebox.askyesno('確認停止',
+            f'停止下載「{target["name"] if target else item_id}」？\n\n'
+            f'yt-dlp 會被 kill，已下載的部分不會保留（--no-part）。'):
+            return
+        ok = tracker.cancel(item_id)
+        if ok:
+            update_status(f'已要求停止：{item_id}')
+        else:
+            update_status(f'停止失敗（process 不存在）：{item_id}')
+
+    # 右鍵 menu on progress_tree
+    def on_progress_right_click(event):
+        iid = progress_tree.identify_row(event.y)
+        if not iid:
+            return
+        progress_tree.selection_set(iid)
+        snap = tracker.snapshot()
+        name_to_id = {it['name']: it['id'] for it in snap}
+        item_id = name_to_id.get(iid)
+        target = next((it for it in snap if it['id'] == item_id), None) if item_id else None
+        menu = tk.Menu(root, tearoff=0)
+        state = target['status'] if target else 'unknown'
+        can_cancel = target and state in ('downloading', 'queued')
+        menu.add_command(label=f'ℹ️ 狀態：{state}', state='disabled')
+        if can_cancel:
+            menu.add_command(label='✕ 停止',
+                             command=lambda: do_cancel_item(item_id, target))
+        else:
+            menu.add_command(label='✕ 停止（不可用）', state='disabled')
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def do_cancel_item(item_id, target):
+        if not messagebox.askyesno('確認停止',
+            f'停止下載「{target["name"]}」？'):
+            return
+        ok = tracker.cancel(item_id)
+        update_status(f'已要求停止：{target["name"]}' if ok else f'停止失敗：{target["name"]}')
+
+    progress_tree.bind('<Button-3>', lambda e: on_progress_right_click(e))
 
     # 綁定 Enter 鍵和按鈕（在 do_search 定義後才能綁）
     entry.bind('<Return>', lambda e: do_search())
@@ -1103,8 +1236,12 @@ def run_gui(api_key: str):
             def _cb(d, t, s, e, _id=ep['id']):
                 tracker.update_progress(_id, d, t, s, e)
             status, info = download_one(ep, str(cur_dir), api_key,
-                                        progress_callback=_cb)
-            if status == 'error':
+                                        progress_callback=_cb, tracker=tracker)
+            if status == 'cancelled':
+                tracker.mark_cancelled(ep['id'])
+                update_status(f'⏹ {ep["name"]} 已停止')
+                return
+            elif status == 'error':
                 tracker.mark_done(ep['id'], ok=False, error=str(info))
                 update_status(f'✗ {ep["name"]}: {info}')
                 messagebox.showerror('失敗', f'{ep["name"]}: {info}')
@@ -1124,8 +1261,11 @@ def run_gui(api_key: str):
         def _cb(d, t, s, e, _id=item['id']):
             tracker.update_progress(_id, d, t, s, e)
         status, info = download_one(item, str(cur_dir), api_key,
-                                    progress_callback=_cb)
-        if status == 'error':
+                                    progress_callback=_cb, tracker=tracker)
+        if status == 'cancelled':
+            tracker.mark_cancelled(item['id'])
+            update_status(f'⏹ {item["name"]} 已停止')
+        elif status == 'error':
             tracker.mark_done(item['id'], ok=False, error=str(info))
             update_status(f'✗ {item["name"]}: {info}')
             messagebox.showerror('失敗', f'{item["name"]}: {info}')
