@@ -995,7 +995,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                     base = list(self.db.movies)
                 else:
                     base = list(self.db.movies)
-                    fn = QUICK_FILTERS.get(quick)
+                    fn = self.QUICK_FILTERS.get(quick)
                     if fn:
                         base = [m for m in base if fn(m)]
                     if t != '全部':
@@ -1009,7 +1009,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                 candidates = self.db.search(q, limit=1000)
                 # 套 quick + type filter
                 if quick != 'all':
-                    fn = QUICK_FILTERS.get(quick)
+                    fn = self.QUICK_FILTERS.get(quick)
                     if fn:
                         candidates = [m for m in candidates if fn(m)]
                 if t != '全部':
