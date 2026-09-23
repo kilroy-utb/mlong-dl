@@ -56,24 +56,6 @@ KNOWN_FOLDERS = {
 
 
 # ── DB 管理 ─────────────────────────────────────────────────
-class MovieDB:
-    """本地電影 DB（從萌龍同步下來）。"""
-
-    def __init__(self, path: Path = DB_PATH):
-        self.path = path
-        self.movies: list = []  # [{"id": "231525", "name": "阿凡達", "folder": "chinese", "year": 2009}, ...]
-        self.load()
-
-    def load(self):
-        if self.path.exists():
-            with open(self.path, encoding='utf-8') as f:
-                self.movies = json.load(f)
-
-    def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, 'w', encoding='utf-8') as f:
-            json.dump(self.movies, f, ensure_ascii=False, indent=2)
-
 # ── 繁簡對照（用 CJK 互換）────────────────────────────────
 # 簡易手動對照表（涵蓋 95% 常見字；不完美但輕量、無依賴）
 T2S_DICT = {
@@ -444,109 +426,571 @@ def cmd_batch(args, client: MlongClient, db: MovieDB):
             cmd_download(args, client, db)
 
 
+# ── Config 管理 ─────────────────────────────────────────────
+class Config:
+    """持久化設定（GUI 用）。"""
+
+    def __init__(self, path: Path = None):
+        self.path = path or Path(__file__).parent / "config.json"
+        self.data = {
+            'download_dir': str(DEFAULT_DOWNLOAD_DIR),
+            'window_size': (900, 600),
+            'concurrent_downloads': 1,
+            'last_query': '',
+        }
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                with open(self.path, encoding='utf-8') as f:
+                    saved = json.load(f)
+                self.data.update(saved)
+            except Exception:
+                pass
+
+    def save(self):
+        try:
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠ config 儲存失敗：{e}")
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+# ── 下載 worker（thread） ──────────────────────────────────────
+class DownloadWorker:
+    """背景 thread，跑單部下載，回呼進度給 GUI。"""
+
+    def __init__(self, movie: dict, url: str, output_dir: Path,
+                 on_progress=None, on_done=None, on_error=None):
+        self.movie = movie
+        self.url = url
+        self.output_dir = output_dir
+        self.on_progress = on_progress or (lambda *a, **k: None)
+        self.on_done = on_done or (lambda *a, **k: None)
+        self.on_error = on_error or (lambda *a, **k: None)
+        self.process = None
+        self.thread = None
+        self.cancelled = False
+        self.output_path = None
+
+    def start(self):
+        import threading
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def cancel(self):
+        self.cancelled = True
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except Exception:
+                pass
+
+    def _run(self):
+        try:
+            ytdlp = find_ytdlp()
+            safe_name = re.sub(r'[\\/:*?"<>|]', '_', self.movie['name'])[:200]
+            year = self.movie.get('year', '')
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.output_path = self.output_dir / f"{safe_name}{' ('+year+')' if year else ''}.mp4"
+
+            cmd = [
+                ytdlp,
+                '-o', str(self.output_path.with_suffix('.%(ext)s')),
+                '--no-mtime',
+                '--no-part',
+                '--newline',
+                '--no-warnings',
+                '--concurrent-fragments', '8',
+                '--retries', '10',
+                '--fragment-retries', '10',
+                self.url,
+            ]
+
+            import subprocess
+            self.process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+
+            last_pct = 0
+            for line in self.process.stdout:
+                if self.cancelled:
+                    break
+                # yt-dlp newline 格式：[download]  45.2% of  2.45GiB at 4.2MiB/s ETA 02:30
+                line = line.strip()
+                m = re.search(r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)', line)
+                if m:
+                    pct = float(m.group(1))
+                    if pct != last_pct:
+                        last_pct = pct
+                        self.on_progress(self, pct, m.group(2), m.group(3), m.group(4))
+                else:
+                    # 其他訊息也回報（讓 GUI 顯示 log）
+                    self.on_progress(self, last_pct, None, None, None, log_line=line)
+
+            self.process.wait()
+            rc = self.process.returncode
+            if self.cancelled or rc != 0:
+                self.on_error(self, f"下載失敗（rc={rc}）")
+            else:
+                self.on_done(self, self.output_path)
+        except Exception as e:
+            self.on_error(self, str(e))
+
+
+# ── GUI 主程式 ────────────────────────────────────────────────
 def cmd_gui(args, client: MlongClient, db: MovieDB):
     """開 Tkinter GUI。"""
     try:
         import tkinter as tk
-        from tkinter import ttk, messagebox
+        from tkinter import ttk, messagebox, filedialog
     except ImportError:
-        print("✗ tkinter 不可用（macOS python.org installer 沒含 tkinter）")
+        print("✗ tkinter 不可用")
         print("  macOS: brew install python-tk")
-        print("  Linux: apt install python3-tk")
+        print("  Linux: sudo apt install python3-tk")
+        print("  Windows: 重裝 Python 時勾選 tcl/tk")
         sys.exit(1)
 
-    if not db.movies:
-        if not messagebox.askyesno("DB 是空的", "DB 還沒建。要先跑 update 嗎？"):
-            return
-        cmd_update(args, client, db)
+    config = Config()
+    download_dir = Path(config.get('download_dir'))
 
     class App:
         def __init__(self, root):
             self.root = root
             self.db = db
             self.client = client
+            self.config = config
+            self.workers = []  # active DownloadWorker
+            self.queue_items = []  # 佇列中等待的 movie dicts
+
             root.title("萌龍下載器 v3")
-            root.geometry("900x600")
+            ws = config.get('window_size', (900, 600))
+            root.geometry(f"{ws[0]}x{ws[1]}")
 
-            # 上：搜尋框
-            top = tk.Frame(root)
-            top.pack(fill='x', padx=10, pady=5)
-            tk.Label(top, text="搜尋:").pack(side='left')
-            self.query_var = tk.StringVar()
+            # 視窗關閉時存設定
+            root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+            # Style
+            style = ttk.Style()
+            try:
+                style.theme_use('clam')
+            except Exception:
+                pass
+
+            # ============ 選單列 ============
+            menubar = tk.Menu(root)
+            file_m = tk.Menu(menubar, tearoff=0)
+            file_m.add_command(label="更新電影清單", command=self.update_db)
+            file_m.add_separator()
+            file_m.add_command(label="離開", command=self.on_close)
+            menubar.add_cascade(label="檔案", menu=file_m)
+
+            help_m = tk.Menu(menubar, tearoff=0)
+            help_m.add_command(label="關於", command=self.show_about)
+            menubar.add_cascade(label="說明", menu=help_m)
+            root.config(menu=menubar)
+
+            # ============ 主體 Notebook ============
+            self.notebook = ttk.Notebook(root)
+            self.notebook.pack(fill='both', expand=True, padx=10, pady=5)
+
+            self._build_search_tab()
+            self._build_browse_tab()
+            self._build_queue_tab()
+            self._build_settings_tab()
+
+            # ============ 底部 status bar ============
+            status_frame = tk.Frame(root, relief='sunken', bd=1)
+            status_frame.pack(fill='x', side='bottom')
+            self.status_label = tk.Label(status_frame, text=f"就緒 · {len(db.movies)} 部電影", anchor='w')
+            self.status_label.pack(fill='x', padx=5, pady=2)
+
+        # ── Tab 1: 搜尋 ─────────────────────
+        def _build_search_tab(self):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text="🔍 搜尋")
+
+            # 搜尋框
+            top = ttk.Frame(tab)
+            top.pack(fill='x', padx=5, pady=5)
+            ttk.Label(top, text="搜尋:").pack(side='left')
+            self.query_var = tk.StringVar(value=self.config.get('last_query', ''))
             self.query_var.trace('w', self.on_search)
-            entry = tk.Entry(top, textvariable=self.query_var, width=60)
+            entry = ttk.Entry(top, textvariable=self.query_var, width=60)
             entry.pack(side='left', padx=5)
-            entry.bind('<Return>', lambda e: self.download_selected())
-            tk.Button(top, text="下載選中", command=self.download_selected).pack(side='left')
+            entry.bind('<Return>', lambda e: self.start_download_selected())
+            ttk.Button(top, text="▶ 立即下載", command=self.start_download_selected).pack(side='left', padx=2)
+            ttk.Button(top, text="+ 加入佇列", command=self.add_to_queue).pack(side='left', padx=2)
 
-            # 中：電影 list
-            mid = tk.Frame(root)
-            mid.pack(fill='both', expand=True, padx=10, pady=5)
-            self.listbox = tk.Listbox(mid, font=('TkFixedFont', 11))
-            scrollbar = ttk.Scrollbar(mid, orient='vertical', command=self.listbox.yview)
-            self.listbox.config(yscrollcommand=scrollbar.set)
-            self.listbox.pack(side='left', fill='both', expand=True)
-            scrollbar.pack(side='right', fill='y')
-            self.listbox.bind('<Double-Button-1>', lambda e: self.download_selected())
-            self.all_movies = list(db.movies)
-            self.refresh_list(self.all_movies)
+            # Listbox
+            mid = ttk.Frame(tab)
+            mid.pack(fill='both', expand=True, padx=5, pady=5)
+            self.search_listbox = tk.Listbox(mid, font=('TkFixedFont', 11), selectmode='single')
+            sb = ttk.Scrollbar(mid, orient='vertical', command=self.search_listbox.yview)
+            self.search_listbox.config(yscrollcommand=sb.set)
+            self.search_listbox.pack(side='left', fill='both', expand=True)
+            sb.pack(side='right', fill='y')
+            self.search_listbox.bind('<Double-Button-1>', lambda e: self.start_download_selected())
+            self.search_listbox.bind('<Return>', lambda e: self.start_download_selected())
 
-            # 下：進度
-            bot = tk.Frame(root)
-            bot.pack(fill='x', padx=10, pady=5)
-            self.progress_label = tk.Label(bot, text="就緒")
-            self.progress_label.pack(side='left')
-            self.progress_bar = ttk.Progressbar(bot, length=400, mode='determinate')
-            self.progress_bar.pack(side='right')
+            # 預設顯示全部
+            self.search_results = list(db.movies)
+            self._refresh_search_list()
+
+        def _refresh_search_list(self):
+            self.search_listbox.delete(0, 'end')
+            for m in self.search_results:
+                year = f" ({m['year']})" if m.get('year') else ''
+                runtime = f" [{m['runtime_ticks']//600000000}分]" if m.get('runtime_ticks') else ''
+                self.search_listbox.insert('end', f"[{m['id']:>10}] {m['name']}{year}{runtime}")
 
         def on_search(self, *args):
-            q = self.query_var.get()
+            q = self.query_var.get().strip()
+            self.config.set('last_query', q)
             if not q:
-                self.refresh_list(self.all_movies)
+                self.search_results = list(self.db.movies)
             else:
-                results = self.db.search(q, limit=200)
-                self.refresh_list(results)
+                self.search_results = self.db.search(q, limit=200)
+            self._refresh_search_list()
+            self.status_label.config(text=f"搜尋 '{q}' → {len(self.search_results)} 筆")
 
-        def refresh_list(self, movies):
-            self.listbox.delete(0, 'end')
-            for m in movies:
-                year = f" ({m.get('year', '')})" if m.get('year') else ''
-                self.listbox.insert('end', f"[{m['id']:>10}] {m['name']}{year}")
-
-        def download_selected(self):
-            sel = self.listbox.curselection()
+        def _get_selected_movie(self):
+            sel = self.search_listbox.curselection()
             if not sel:
                 messagebox.showinfo("提示", "請先選一部電影")
-                return
-            line = self.listbox.get(sel[0])
+                return None
+            line = self.search_listbox.get(sel[0])
             m = re.match(r'\[(\d+)\]', line)
             if not m:
-                return
+                return None
             item_id = m.group(1)
             movie = self.db.get(item_id) or {'id': item_id, 'name': f'movie_{item_id}', 'year': ''}
+            return movie
+
+        def start_download_selected(self):
+            movie = self._get_selected_movie()
+            if not movie:
+                return
+            self._start_download(movie)
+
+        def add_to_queue(self):
+            movie = self._get_selected_movie()
+            if not movie:
+                return
+            self.queue_items.append(movie)
+            self._refresh_queue_list()
+            self.status_label.config(text=f"已加入佇列：{movie['name']}")
+
+        # ── Tab 2: 瀏覽全部 ────────────────
+        def _build_browse_tab(self):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text="📚 瀏覽全部")
+
+            top = ttk.Frame(tab)
+            top.pack(fill='x', padx=5, pady=5)
+            ttk.Label(top, text="類別:").pack(side='left')
+            self.browse_folder = tk.StringVar(value='全部')
+            folder_combo = ttk.Combobox(top, textvariable=self.browse_folder, state='readonly', width=15)
+            folders = ['全部'] + sorted({m['folder'] for m in db.movies if m.get('folder')})
+            folder_combo['values'] = folders
+            folder_combo.pack(side='left', padx=5)
+            folder_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_browse_list())
+
+            ttk.Label(top, text="排序:").pack(side='left', padx=(20, 0))
+            self.browse_sort = tk.StringVar(value='名稱')
+            sort_combo = ttk.Combobox(top, textvariable=self.browse_sort, state='readonly', width=15)
+            sort_combo['values'] = ['名稱', '年份（新→舊）', '年份（舊→新）', '時長（長→短）']
+            sort_combo.pack(side='left', padx=5)
+            sort_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_browse_list())
+
+            mid = ttk.Frame(tab)
+            mid.pack(fill='both', expand=True, padx=5, pady=5)
+            self.browse_listbox = tk.Listbox(mid, font=('TkFixedFont', 10), selectmode='extended')
+            sb = ttk.Scrollbar(mid, orient='vertical', command=self.browse_listbox.yview)
+            self.browse_listbox.config(yscrollcommand=sb.set)
+            self.browse_listbox.pack(side='left', fill='both', expand=True)
+            sb.pack(side='right', fill='y')
+            self.browse_listbox.bind('<Double-Button-1>', lambda e: self.browse_double_click())
+
+            bottom = ttk.Frame(tab)
+            bottom.pack(fill='x', padx=5, pady=5)
+            ttk.Button(bottom, text="▶ 下載選中", command=self.browse_download_selected).pack(side='left', padx=2)
+            ttk.Button(bottom, text="+ 全部加入佇列", command=self.browse_add_all_to_queue).pack(side='left', padx=2)
+            self.browse_count_label = ttk.Label(bottom, text="")
+            self.browse_count_label.pack(side='right', padx=5)
+
+            self._refresh_browse_list()
+
+        def _refresh_browse_list(self):
+            movies = list(self.db.movies)
+            folder = self.browse_folder.get()
+            if folder != '全部':
+                movies = [m for m in movies if m.get('folder') == folder]
+
+            sort = self.browse_sort.get()
+            if sort == '名稱':
+                movies.sort(key=lambda m: m['name'])
+            elif sort == '年份（新→舊）':
+                movies.sort(key=lambda m: -int(m.get('year') or 0))
+            elif sort == '年份（舊→新）':
+                movies.sort(key=lambda m: int(m.get('year') or 0))
+            elif sort == '時長（長→短）':
+                movies.sort(key=lambda m: -m.get('runtime_ticks', 0))
+
+            self.browse_listbox.delete(0, 'end')
+            for m in movies:
+                year = f" ({m['year']})" if m.get('year') else ''
+                runtime = f" [{m['runtime_ticks']//600000000}分]" if m.get('runtime_ticks') else ''
+                folder_tag = f" [{m['folder']}]" if m.get('folder') else ''
+                self.browse_listbox.insert('end', f"[{m['id']:>10}] {m['name']}{year}{runtime}{folder_tag}")
+
+            self.browse_count_label.config(text=f"顯示 {len(movies)} / {len(self.db.movies)} 部")
+            self.browse_movies = movies
+
+        def _get_browse_selected(self):
+            sels = self.browse_listbox.curselection()
+            if not sels:
+                return []
+            return [self.browse_movies[i] for i in sels]
+
+        def browse_double_click(self):
+            sel = self._get_browse_selected()
+            if sel:
+                self._start_download(sel[0])
+
+        def browse_download_selected(self):
+            sel = self._get_browse_selected()
+            if not sel:
+                messagebox.showinfo("提示", "請先選電影")
+                return
+            for m in sel:
+                self._start_download(m)
+
+        def browse_add_all_to_queue(self):
+            self.queue_items.extend(self.browse_movies)
+            self._refresh_queue_list()
+            self.status_label.config(text=f"已加入 {len(self.browse_movies)} 部到佇列")
+
+        # ── Tab 3: 下載佇列 ────────────────
+        def _build_queue_tab(self):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text="⏬ 佇列")
+
+            # 上：正在下載
+            ttk.Label(tab, text="正在下載:").pack(anchor='w', padx=5, pady=(5, 0))
+            self.active_frame = ttk.Frame(tab)
+            self.active_frame.pack(fill='x', padx=5)
+            self.active_labels = {}  # worker_id -> dict of widgets
+
+            # 中：佇列中
+            ttk.Label(tab, text="等待中:").pack(anchor='w', padx=5, pady=(10, 0))
+            mid = ttk.Frame(tab)
+            mid.pack(fill='both', expand=True, padx=5, pady=5)
+            self.queue_listbox = tk.Listbox(mid, font=('TkFixedFont', 11))
+            sb = ttk.Scrollbar(mid, orient='vertical', command=self.queue_listbox.yview)
+            self.queue_listbox.config(yscrollcommand=sb.set)
+            self.queue_listbox.pack(side='left', fill='both', expand=True)
+            sb.pack(side='right', fill='y')
+
+            # 下：按鈕
+            bottom = ttk.Frame(tab)
+            bottom.pack(fill='x', padx=5, pady=5)
+            ttk.Button(bottom, text="▶ 開始佇列", command=self.process_queue).pack(side='left', padx=2)
+            ttk.Button(bottom, text="清空已完成", command=self.clear_finished).pack(side='left', padx=2)
+            ttk.Button(bottom, text="清空佇列", command=self.clear_queue).pack(side='left', padx=2)
+
+            self._refresh_queue_list()
+
+        def _refresh_queue_list(self):
+            self.queue_listbox.delete(0, 'end')
+            for i, m in enumerate(self.queue_items, 1):
+                year = f" ({m['year']})" if m.get('year') else ''
+                self.queue_listbox.insert('end', f"[{i}] [{m['id']}] {m['name']}{year}")
+
+        def process_queue(self):
+            """啟動佇列裡的下一批下載。"""
+            if not self.queue_items:
+                messagebox.showinfo("提示", "佇列是空的")
+                return
+            max_concurrent = self.config.get('concurrent_downloads', 1)
+            active = len(self.workers)
+            while self.queue_items and active < max_concurrent:
+                movie = self.queue_items.pop(0)
+                self._refresh_queue_list()
+                self._start_download(movie)
+                active += 1
+
+        def clear_queue(self):
+            self.queue_items.clear()
+            self._refresh_queue_list()
+
+        def clear_finished(self):
+            self.workers = [w for w in self.workers if w.process and w.process.poll() is None]
+
+        # ── Tab 4: 設定 ────────────────────
+        def _build_settings_tab(self):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text="⚙ 設定")
+
+            row = 0
+
+            # 下載目錄
+            ttk.Label(tab, text="下載目錄:").grid(row=row, column=0, sticky='e', padx=5, pady=5)
+            self.dir_var = tk.StringVar(value=str(download_dir))
+            ttk.Entry(tab, textvariable=self.dir_var, width=50).grid(row=row, column=1, padx=5)
+            ttk.Button(tab, text="瀏覽...", command=self.browse_dir).grid(row=row, column=2, padx=5)
+            row += 1
+
+            # 並發數
+            ttk.Label(tab, text="同時下載數:").grid(row=row, column=0, sticky='e', padx=5, pady=5)
+            self.concurrent_var = tk.IntVar(value=self.config.get('concurrent_downloads', 1))
+            ttk.Spinbox(tab, from_=1, to=8, textvariable=self.concurrent_var, width=10).grid(row=row, column=1, sticky='w', padx=5)
+            row += 1
+
+            # API key
+            ttk.Label(tab, text="API Key:").grid(row=row, column=0, sticky='e', padx=5, pady=5)
+            self.api_key_var = tk.StringVar(value=args.api_key or '')
+            ttk.Entry(tab, textvariable=self.api_key_var, width=50, show='*').grid(row=row, column=1, padx=5)
+            row += 1
+
+            # Server
+            ttk.Label(tab, text="Server:").grid(row=row, column=0, sticky='e', padx=5, pady=5)
+            self.server_var = tk.StringVar(value=args.server or DEFAULT_SERVER)
+            ttk.Entry(tab, textvariable=self.server_var, width=50).grid(row=row, column=1, padx=5)
+            row += 1
+
+            # Device ID
+            ttk.Label(tab, text="Device ID:").grid(row=row, column=0, sticky='e', padx=5, pady=5)
+            self.device_var = tk.StringVar(value=args.device_id or DEFAULT_DEVICE_ID)
+            ttk.Entry(tab, textvariable=self.device_var, width=50).grid(row=row, column=1, padx=5)
+            row += 1
+
+            # 儲存按鈕
+            ttk.Button(tab, text="💾 儲存", command=self.save_settings).grid(row=row, column=1, sticky='w', padx=5, pady=10)
+
+            # 狀態
+            self.settings_status = ttk.Label(tab, text="")
+            self.settings_status.grid(row=row+1, column=1, sticky='w', padx=5)
+
+            # DB 統計
+            ttk.Separator(tab, orient='horizontal').grid(row=row+2, column=0, columnspan=3, sticky='we', pady=20)
+            ttk.Label(tab, text=f"DB 統計:").grid(row=row+3, column=0, sticky='e', padx=5)
+            stats = f"{len(db.movies)} 部電影，{len({m.get('folder') for m in db.movies})} 個類別"
+            ttk.Label(tab, text=stats).grid(row=row+3, column=1, sticky='w', padx=5)
+
+        def browse_dir(self):
+            d = filedialog.askdirectory(initialdir=self.dir_var.get())
+            if d:
+                self.dir_var.set(d)
+
+        def save_settings(self):
+            self.config.set('download_dir', self.dir_var.get())
+            self.config.set('concurrent_downloads', self.concurrent_var.get())
+            self.config.save()
+            self.settings_status.config(text="✓ 已儲存", foreground='green')
+            self.root.after(3000, lambda: self.settings_status.config(text=""))
+
+        # ── 共通：下載 ─────────────────────
+        def _start_download(self, movie):
+            item_id = movie['id']
             url = self.client.build_original_url(item_id)
-            out_dir = Path(args.output) if hasattr(args, 'output') and args.output else DEFAULT_DOWNLOAD_DIR
-            safe_name = re.sub(r'[\\/:*?"<>|]', '_', movie['name'])[:200]
-            year = movie.get('year', '')
-            out_path = out_dir / f"{safe_name}{' ('+year+')' if year else ''}.mp4"
+            out_dir = Path(self.dir_var.get())
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-            self.progress_label.config(text=f"下載中：{movie['name']}...")
-            self.progress_bar.config(mode='indeterminate')
-            self.progress_bar.start()
-            self.root.update()
+            # 建立 worker
+            def on_progress(worker, pct, total, speed, eta, log_line=None):
+                if log_line and not total:
+                    return  # 跳過非進度訊息（避免洗版）
+                wid = id(worker)
+                if wid in self.active_labels:
+                    widgets = self.active_labels[wid]
+                    widgets['bar']['value'] = pct
+                    widgets['text'].config(
+                        text=f"{worker.movie['name']} · {pct:.1f}% · {speed or ''} · {eta or ''}")
 
-            ok = download_with_ytdlp(url, out_path, title_hint=movie['name'])
-            self.progress_bar.stop()
-            self.progress_bar.config(mode='determinate', value=100 if ok else 0)
-            if ok:
-                self.progress_label.config(text=f"✓ 完成：{out_path.name}")
-                messagebox.showinfo("完成", f"下載成功！\n{out_path}")
-            else:
-                self.progress_label.config(text=f"✗ 失敗")
-                messagebox.showerror("失敗", "下載失敗，請看 terminal log")
+            def on_done(worker, path):
+                wid = id(worker)
+                if wid in self.active_labels:
+                    self.active_labels[wid]['text'].config(
+                        text=f"✓ {worker.movie['name']} → {path.name}", foreground='green')
+                self.status_label.config(text=f"✓ 完成：{worker.movie['name']}")
+                # 自動啟動佇列下一個
+                self.process_queue()
+
+            def on_error(worker, err):
+                wid = id(worker)
+                if wid in self.active_labels:
+                    self.active_labels[wid]['text'].config(
+                        text=f"✗ {worker.movie['name']} · {err}", foreground='red')
+                self.status_label.config(text=f"✗ 失敗：{worker.movie['name']}")
+                self.process_queue()
+
+            worker = DownloadWorker(movie, url, out_dir, on_progress, on_done, on_error)
+            self.workers.append(worker)
+
+            # 加到 active_frame
+            row_frame = ttk.Frame(self.active_frame)
+            row_frame.pack(fill='x', pady=2)
+            bar = ttk.Progressbar(row_frame, length=300, mode='determinate', maximum=100)
+            bar.pack(side='left', padx=(0, 10))
+            text = ttk.Label(row_frame, text=f"⏳ {movie['name']} 開始中...", width=60)
+            text.pack(side='left')
+            cancel_btn = ttk.Button(row_frame, text="✗", width=3,
+                                    command=lambda: self.cancel_download(worker))
+            cancel_btn.pack(side='left', padx=5)
+
+            self.active_labels[id(worker)] = {'frame': row_frame, 'bar': bar, 'text': text}
+
+            worker.start()
+            self.status_label.config(text=f"⏳ 開始下載：{movie['name']}")
+
+        def cancel_download(self, worker):
+            worker.cancel()
+            wid = id(worker)
+            if wid in self.active_labels:
+                self.active_labels[wid]['text'].config(
+                    text=f"✗ {worker.movie['name']} · 已取消", foreground='orange')
+
+        def on_close(self):
+            # 存設定
+            try:
+                ws = (self.root.winfo_width(), self.root.winfo_height())
+                self.config.set('window_size', ws)
+                self.config.save()
+            except Exception:
+                pass
+            self.root.destroy()
+
+        # ── 工具命令 ─────────────────────────
+        def update_db(self):
+            if messagebox.askyesno("更新", "從萌龍重新同步所有電影？這會跑 1-2 分鐘。"):
+                try:
+                    cmd_update(args, self.client, self.db)
+                    messagebox.showinfo("完成", f"已更新 {len(self.db.movies)} 部電影")
+                    self.status_label.config(text=f"已更新 DB · {len(self.db.movies)} 部電影")
+                    self._refresh_search_list()
+                    self._refresh_browse_list()
+                except Exception as e:
+                    messagebox.showerror("失敗", str(e))
+
+        def show_about(self):
+            messagebox.showinfo("關於",
+                "萌龍下載器 v3\n\n"
+                "萌龍雅軒 (mlong.cutedragon.vip) 影片下載工具\n\n"
+                "GitHub: https://github.com/kilroy-utb/mlong-dl")
 
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    # 預設填入搜尋框 focus
+    root.after(100, lambda: root.focus_force())
     root.mainloop()
 
 
