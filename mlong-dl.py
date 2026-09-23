@@ -45,6 +45,8 @@ except ImportError:
 DEFAULT_SERVER = "https://mlong.cutedragon.vip:8888"
 DEFAULT_DEVICE_ID = "4068e636-c8e6-4a84-80aa-24dd4a40aefa"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "mlong-dl"
+# v1.5.8：保留 DEFAULT_DOWNLOAD_DIR 為 ~/Downloads/mlong-dl
+# 如果想用其他路徑，設定 config.json 的 download_dir 欄位即可
 DB_PATH = Path(__file__).parent / "db.json"
 
 
@@ -1039,16 +1041,15 @@ class Config:
         if path is None:
             path = Path(__file__).parent / "config.json"
         self.path = Path(path) if not isinstance(path, Path) else path
-        # v1.5.4：第一次啟動時偵測 NAS 路徑優先
-        nas = detect_nas_dir()
-        default_dl = str(nas / "mlong-dl") if nas else str(DEFAULT_DOWNLOAD_DIR)
+        # v1.5.8：不自動偵測 NAS（user 決定走 PC 本地，不掛 NAS）
+        # 想恢復 NAS 偵測，把 nas = detect_nas_dir() 開回
+        default_dl = str(DEFAULT_DOWNLOAD_DIR)
         self.data = {
             'download_dir': default_dl,
             'window_size': (900, 600),
             'concurrent_downloads': 1,
             'last_query': '',
             'max_display': 500,  # v1.4.1: listbox 一次顯示幾筆
-            'nas_detected': str(nas) if nas else '',  # 記下偵測結果給 GUI 顯示
         }
         self.load()
 
@@ -1205,8 +1206,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
     config = Config()
     print(f"  ✓ 下載目錄: {config.get('download_dir')}")
-    if config.get('nas_detected'):
-        print(f"  💡 偵測到 NAS: {config.get('nas_detected')}")
+    # v1.5.8：移除 NAS 偵測提示（user 不使用 NAS）
     print(f"  ✓ DB: {len(db.movies):,} 筆（{db.path}）")
     print(f"  ✓ 設定檔: {config.path}")
     print()
@@ -1874,13 +1874,10 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
             row = 0
 
-            # v1.5.4：NAS 偵測狀態
-            nas_detected = self.config.get('nas_detected', '')
-            if nas_detected:
-                ttk.Label(tab, text=f"💡 偵測到 NAS 路徑：{nas_detected}",
-                          foreground='green').grid(row=row, column=0, columnspan=3,
-                                                  sticky='w', padx=5, pady=2)
-                row += 1
+            # v1.5.4-1.5.7：NAS 偵測狀態（v1.5.8 拿掉，user 不使用 NAS）
+            # nas_detected = self.config.get('nas_detected', '')
+            # if nas_detected:
+            #     ttk.Label(tab, text=f"💡 偵測到 NAS 路徑：{nas_detected}", ...)
 
             # 下載目錄
             ttk.Label(tab, text="下載目錄:").grid(row=row, column=0, sticky='e', padx=5, pady=5)
