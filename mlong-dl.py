@@ -454,6 +454,41 @@ class MlongClient:
                 break
         return movies
 
+    def get_seasons(self, series_id: str) -> list:
+        """從 Series ID 拿所有 Season 物件。"""
+        params = {
+            'api_key': self.api_key,
+            'ParentId': series_id,
+            'Fields': 'Name,IndexNumber,ChildCount,SeriesId',
+        }
+        r = self.s.get(self._url('/Items'), params=params)
+        r.raise_for_status()
+        data = r.json()
+        return [it for it in data.get('Items', []) if it.get('Type') == 'Season']
+
+    def get_episodes(self, season_id: str) -> list:
+        """從 Season ID 拿所有 Episode 物件。"""
+        params = {
+            'api_key': self.api_key,
+            'ParentId': season_id,
+            'IncludeItemTypes': 'Episode',
+            'Fields': 'Name,IndexNumber,ParentIndexNumber,SeriesId,SeriesName,'
+                      'SeasonId,RunTimeTicks',
+        }
+        r = self.s.get(self._url('/Items'), params=params)
+        r.raise_for_status()
+        data = r.json()
+        return [it for it in data.get('Items', []) if it.get('Type') == 'Episode']
+
+    def get_all_episodes_for_series(self, series_id: str) -> list:
+        """從 Series 一次拿所有 episodes（兩步：seasons → each season's episodes）。"""
+        seasons = self.get_seasons(series_id)
+        all_eps = []
+        for s in seasons:
+            eps = self.get_episodes(s['Id'])
+            all_eps.extend(eps)
+        return all_eps
+
     def build_original_url(self, item_id: str) -> str:
         """拼 original.mp4 URL。萌龍雅軒不需要 MediaSourceId/PlaySessionId。"""
         return (f"{self.server}/emby/videos/{item_id}/original.mp4"
@@ -633,6 +668,46 @@ def cmd_download_id(args, client: MlongClient, db: MovieDB):
     ok = download_with_ytdlp(url, out_path)
     if ok and out_path.exists():
         print(f"\n✓ 完成：{out_path} ({out_path.stat().st_size/1024/1024:.1f} MB)")
+
+
+def cmd_series(args, client: MlongClient, db: MovieDB):
+    """抓整個 series（從萌龍拉所有 episodes 一個個抓）。"""
+    series_id = args.series_id
+    # 嘗試從 DB 拿名字，沒有也沒差
+    movie = db.get(series_id) if db.movies else None
+    if movie:
+        sname = movie.get('name', f'series_{series_id}')
+    else:
+        sname = f'series_{series_id}'
+
+    print(f"\n▶ 抓 series '{sname}' ({series_id}) 的所有 episodes...")
+    try:
+        eps = client.get_all_episodes_for_series(series_id)
+    except Exception as e:
+        print(f"✗ 抓 episodes 失敗：{e}")
+        return
+    print(f"  找到 {len(eps)} 集")
+
+    out_dir = Path(args.output) if args.output else DEFAULT_DOWNLOAD_DIR
+    series_safe = re.sub(r'[\\/:*?"<>|]', '_', sname)[:100]
+
+    success = 0
+    for i, ep in enumerate(eps, 1):
+        ep_id = ep['Id']
+        ep_name = ep.get('Name', f'episode_{ep_id}')
+        sn = ep.get('ParentIndexNumber') or 1
+        en = ep.get('IndexNumber') or i
+        ep_safe = re.sub(r'[\\/:*?"<>|]', '_', ep_name)[:100]
+        out_path = out_dir / f"{series_safe} - S{sn:02d}E{en:02d} 「{ep_safe}」.mp4"
+
+        print(f"\n  [{i}/{len(eps)}] S{sn:02d}E{en:02d} {ep_name}")
+        url = client.build_original_url(ep_id)
+        ok = download_with_ytdlp(url, out_path)
+        if ok and out_path.exists():
+            print(f"    ✓ {out_path.name} ({out_path.stat().st_size/1024/1024:.1f} MB)")
+            success += 1
+
+    print(f"\n=== 完成 {success}/{len(eps)} 集 ===")
 
 
 def cmd_list(args, client: MlongClient, db: MovieDB):
@@ -1201,15 +1276,76 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             movie = self._get_selected_movie()
             if not movie:
                 return
-            self._start_download(movie)
+            if movie.get('type') == 'Series':
+                # 劇集：跳到下載整個 series 的流程
+                self.download_series(movie)
+            else:
+                self._start_download(movie)
 
         def add_to_queue(self):
             movie = self._get_selected_movie()
             if not movie:
                 return
-            self.queue_items.append(movie)
+            if movie.get('type') == 'Series':
+                self.enqueue_series(movie)
+            else:
+                self.queue_items.append(movie)
+                self._refresh_queue_list()
+                self.status_label.config(text=f"已加入佇列：{movie['name']}")
+
+        def download_series(self, movie):
+            """抓整個 series：fetch 所有 episodes → 加進佇列 → 自動開始。"""
+            sid = movie['id']
+            sname = movie['name']
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "確認下載整個 Series",
+                f"「{sname}」\n\n會自動抓所有 episodes 加進佇列後開始下載。\n\n繼續？"
+            ):
+                return
+            self.enqueue_series(movie, start=True)
+
+        def enqueue_series(self, movie, start=False):
+            """從萌龍抓所有 episodes，轉成 movie dict 加進佇列。"""
+            sid = movie['id']
+            sname = movie['name']
+            self.status_label.config(text=f"抓 {sname} 的 episodes 中...")
+            self.root.update_idletasks()
+            try:
+                eps = self.client.get_all_episodes_for_series(sid)
+            except Exception as e:
+                from tkinter import messagebox
+                messagebox.showerror("抓 episodes 失敗", str(e))
+                self.status_label.config(text=f"✗ 抓 episodes 失敗")
+                return
+            if not eps:
+                from tkinter import messagebox
+                messagebox.showinfo("沒有 episodes", "這個 series 沒有任何 episodes")
+                return
+
+            # 轉成 movie dict 格式（_display 等）
+            added = 0
+            for ep in eps:
+                m = {
+                    'id': ep['Id'],
+                    'name': ep['Name'],
+                    'year': '',
+                    'folder': movie.get('folder', ''),
+                    'type': 'Episode',
+                    'season': ep.get('ParentIndexNumber'),
+                    'episode': ep.get('IndexNumber'),
+                    'series_name': ep.get('SeriesName', sname),
+                    'runtime_ticks': ep.get('RunTimeTicks', 0),
+                }
+                m['_display'] = MovieDB._format_display(m)
+                self.queue_items.append(m)
+                added += 1
+
             self._refresh_queue_list()
-            self.status_label.config(text=f"已加入佇列：{movie['name']}")
+            self.status_label.config(
+                text=f"✓ {sname}: 加入 {added} 集到佇列")
+            if start:
+                self.process_queue()
 
         # ── Tab 2: 瀏覽全部 ────────────────
         def _build_browse_tab(self):
@@ -1322,8 +1458,13 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
         def browse_double_click(self):
             sel = self._get_browse_selected()
-            if sel:
-                self._start_download(sel[0])
+            if not sel:
+                return
+            m = sel[0]
+            if m.get('type') == 'Series':
+                self.download_series(m)
+            else:
+                self._start_download(m)
 
         def browse_download_selected(self):
             sel = self._get_browse_selected()
@@ -1331,12 +1472,43 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                 messagebox.showinfo("提示", "請先選電影")
                 return
             for m in sel:
-                self._start_download(m)
+                if m.get('type') == 'Series':
+                    self.enqueue_series(m, start=False)
+                else:
+                    self._start_download(m)
 
         def browse_add_all_to_queue(self):
-            self.queue_items.extend(self.browse_movies)
+            # v1.5.0：對 Series 自動展開成 episodes
+            series_count = 0
+            for m in self.browse_movies:
+                if m.get('type') == 'Series':
+                    try:
+                        eps = self.client.get_all_episodes_for_series(m['id'])
+                        for ep in eps:
+                            ep_m = {
+                                'id': ep['Id'],
+                                'name': ep['Name'],
+                                'year': '',
+                                'folder': m.get('folder', ''),
+                                'type': 'Episode',
+                                'season': ep.get('ParentIndexNumber'),
+                                'episode': ep.get('IndexNumber'),
+                                'series_name': ep.get('SeriesName', m['name']),
+                                'runtime_ticks': ep.get('RunTimeTicks', 0),
+                            }
+                            ep_m['_display'] = MovieDB._format_display(ep_m)
+                            self.queue_items.append(ep_m)
+                        series_count += 1
+                    except Exception as e:
+                        print(f"展開 {m['name']} 失敗: {e}")
+                else:
+                    self.queue_items.append(m)
             self._refresh_queue_list()
-            self.status_label.config(text=f"已加入 {len(self.browse_movies)} 部到佇列")
+            n = len(self.queue_items)
+            msg = f"已加入 {n} 項到佇列"
+            if series_count:
+                msg += f"（展開 {series_count} 個 series）"
+            self.status_label.config(text=msg)
 
         # ── Tab 3: 下載佇列 ────────────────
         def _build_queue_tab(self):
@@ -1590,6 +1762,11 @@ def main():
     p_id = sub.add_parser('id', help='用 Item ID 下載')
     p_id.add_argument('item_id')
     p_id.set_defaults(func=cmd_download_id)
+
+    # series - 抓整個 series
+    p_series = sub.add_parser('series', help='抓整個 series（自動展開所有 episodes）')
+    p_series.add_argument('series_id', help='Series 的 Item ID')
+    p_series.set_defaults(func=cmd_series)
 
     # list
     p_list = sub.add_parser('list', help='列出所有電影')
