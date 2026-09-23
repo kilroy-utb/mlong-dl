@@ -512,16 +512,16 @@ def run_gui(api_key: str):
     update_btn = ttk.Menubutton(top, text='更新 DB ▼')
     update_menu = tk.Menu(update_btn, tearoff=0)
     update_menu.add_command(label='更新整個 DB (慢, 14分鐘)',
-                           command=update_all)
+                           command=lambda: update_all())
     update_menu.add_command(label='更新單個 series (打 ID)',
-                           command=update_single)
+                           command=lambda: update_single())
     update_menu.add_command(label='更新單個 series (從搜尋結果)',
-                           command=update_from_selection)
+                           command=lambda: update_from_selection())
     update_btn['menu'] = update_menu
     update_btn.pack(side='left', padx=20)
 
     # 顯示下載目錄
-    ttk.Button(top, text='📁 ' + str(DOWNLOAD_DIR), command=open_download_dir).pack(side='right')
+    ttk.Button(top, text='📁 ' + str(DOWNLOAD_DIR), command=lambda: open_download_dir()).pack(side='right')
 
     # ── 結果區 (lazy — 沒搜尋結果不顯示) ──────────────────────
     result_frame = ttk.LabelFrame(root, text='搜尋結果', padding=5)
