@@ -82,7 +82,7 @@ read -p "要下載嗎？[y/N]: " DL
 if [[ "$DL" =~ ^[Yy]$ ]]; then
     DB_URL="https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
 
-    # 偵測 python 命令（Windows 用 python，Linux/macOS 用 python3）
+    # 偵測 python 命令
     if command -v python3 &> /dev/null; then
         PY=python3
     elif command -v python &> /dev/null; then
@@ -91,51 +91,56 @@ if [[ "$DL" =~ ^[Yy]$ ]]; then
         PY=""
     fi
 
+    TARGET_DIR="$(pwd)"
+    DB_GZ="$TARGET_DIR/db.json.gz"
+    DB="$TARGET_DIR/db.json"
+    rm -f "$DB_GZ" "$DB"
+
     if [[ -z "$PY" ]]; then
-        echo "✗ 找不到 python，請手動下載 + 解壓"
+        echo "✗ 找不到 python，請手動下載 + 用 gunzip 解"
     else
         echo "▶ 下載 db.json.gz (3.5 MB)..."
-        echo "  CWD: $(pwd)"
-        echo "  PY: $PY"
+        echo "  CWD: $TARGET_DIR"
 
-        # 改成絕對路徑，避免 CWD 不一致
-        TARGET_DIR="$(pwd)"
-        DB_GZ="$TARGET_DIR/db.json.gz"
-        DB="$TARGET_DIR/db.json"
-
-        rm -f "$DB_GZ" "$DB"
-
-        echo "  Target: $DB_GZ"
-        echo "  curl start..."
-
-        # 不用 --progress-bar (Git Bash 上可能怪)，改用普通 -L
-        curl -L -o "$DB_GZ" "$DB_URL"
-        CURL_EXIT=$?
-
-        echo "  curl done, exit=$CURL_EXIT"
-
-        if [[ -f "$DB_GZ" ]]; then
-            GZ_SIZE=$(stat -c%s "$DB_GZ" 2>/dev/null || stat -f%z "$DB_GZ" 2>/dev/null)
-            echo "  db.json.gz exists, size=$GZ_SIZE bytes"
-        else
-            echo "  db.json.gz NOT EXISTS"
+        # 多種方法 try，總有一個會 work
+        DOWNLOADED=no
+        if [[ "$DOWNLOADED" == "no" ]] && command -v curl &> /dev/null; then
+            echo "  用 curl..."
+            curl -L -o "$DB_GZ" "$DB_URL" 2>/dev/null
+            [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+        fi
+        if [[ "$DOWNLOADED" == "no" ]] && command -v wget &> /dev/null; then
+            echo "  用 wget..."
+            wget -O "$DB_GZ" "$DB_URL" 2>/dev/null
+            [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+        fi
+        if [[ "$DOWNLOADED" == "no" ]] && command -v powershell.exe &> /dev/null; then
+            echo "  用 PowerShell..."
+            powershell.exe -Command "Invoke-WebRequest -Uri '$DB_URL' -OutFile '$DB_GZ' -UseBasicParsing" 2>/dev/null
+            [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
+        fi
+        if [[ "$DOWNLOADED" == "no" ]] && command -v powershell &> /dev/null; then
+            echo "  用 PowerShell (no .exe)..."
+            powershell -Command "Invoke-WebRequest -Uri '$DB_URL' -OutFile '$DB_GZ' -UseBasicParsing" 2>/dev/null
+            [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
         fi
 
-        if [[ ! -s "$DB_GZ" ]]; then
-            echo "✗ db.json.gz 下載失敗或為空"
-            echo "  試手動: 瀏覽器下載 https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
-            echo "  放到 $TARGET_DIR/ 然後按 Enter"
+        if [[ "$DOWNLOADED" == "no" ]]; then
+            echo ""
+            echo "✗ 自動下載失敗（沒找到 curl / wget / powershell）"
+            echo ""
+            echo "  請手動下載："
+            echo "  1. 瀏覽器開 https://github.com/kilroy-utb/mlong-dl/releases/download/v1.2.0/db.json.gz"
+            echo "  2. 存到 $TARGET_DIR/db.json.gz"
+            echo "  3. 按 Enter 繼續"
+            echo ""
             read
-            if [[ ! -s "$DB_GZ" ]]; then
-                echo "✗ 還是沒有 db.json.gz，跳過解壓"
-            fi
+            [[ -s "$DB_GZ" ]] && DOWNLOADED=yes
         fi
 
-        if [[ -s "$DB_GZ" ]]; then
+        if [[ "$DOWNLOADED" == "yes" ]] && [[ -s "$DB_GZ" ]]; then
             echo "▶ 用 $PY 解壓..."
             "$PY" -c "import gzip; open('$DB','wb').write(gzip.decompress(open('$DB_GZ','rb').read()))"
-            PY_EXIT=$?
-            echo "  python exit=$PY_EXIT"
             rm -f "$DB_GZ"
             if [[ -s "$DB" ]]; then
                 DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || stat -f%z "$DB" 2>/dev/null)
@@ -143,6 +148,8 @@ if [[ "$DL" =~ ^[Yy]$ ]]; then
             else
                 echo "✗ 解壓失敗"
             fi
+        else
+            echo "✗ 還是沒有 db.json.gz"
         fi
     fi
 fi
