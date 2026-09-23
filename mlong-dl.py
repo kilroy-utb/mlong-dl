@@ -26,6 +26,24 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+# ── v2.6：嘗試 ujson 加速 JSON I/O（5-10x），失敗 fallback stdlib ──
+try:
+    import ujson as _json
+    _HAS_UJSON = True
+except ImportError:
+    import json as _json
+    _HAS_UJSON = False
+
+def _json_load(path_or_str):
+    if isinstance(path_or_str, (str, bytes)):
+        return _json.loads(path_or_str)
+    return _json.load(path_or_str)
+
+def _json_dump(obj, file, **kw):
+    # ujson 不支援 indent 參數（indent=None），所以用 compact 模式
+    kw.setdefault('separators', (',', ':'))
+    return _json.dump(obj, file, **kw)
+
 # ── 嘗試 import requests ────────────────────────────────
 try:
     import requests
@@ -145,6 +163,9 @@ class MovieDB:
         self._display = {}    # id -> pre-formatted display string
         self._name_alt = {}   # id -> 簡轉繁 name (lowercase)
         self._name_simp = {}  # id -> 繁轉簡 name (lowercase)
+        # v2.6：metadata 層 — 記 folder/series 最後 update 時間，給增量更新用
+        self._last_updated_per_folder = {}   # {'chinese_tv': '2026-09-20T12:00:00', ...}
+        self._last_updated_per_series = {}   # {'375871': '2026-09-20T12:00:00', ...}
         self.load()
 
     @staticmethod
@@ -156,9 +177,21 @@ class MovieDB:
         if not self.path.exists():
             return
         with open(self.path, encoding='utf-8') as f:
-            self.movies = json.load(f)
+            data = _json_load(f)
+        # v2.6 格式: {movies: [...], meta: {...}}
+        # 舊格式（v2.5 之前）：純 list
+        if isinstance(data, dict) and 'movies' in data:
+            self.movies = data.get('movies', [])
+            meta = data.get('meta', {})
+            self._last_updated_per_folder = meta.get('last_updated_per_folder', {})
+            self._last_updated_per_series = meta.get('last_updated_per_series', {})
+        else:
+            self.movies = data
+            self._last_updated_per_folder = {}
+            self._last_updated_per_series = {}
         self._build_indexes()
-        print(f'  ✓ DB loaded: {len(self.movies):,} 筆 ({self.path})')
+        print(f'  ✓ DB loaded: {len(self.movies):,} 筆 ({self.path}) '
+              f'ujson={_HAS_UJSON}')
 
     def _build_indexes(self):
         t0 = time.time()
@@ -193,12 +226,24 @@ class MovieDB:
               f'{len(self._index_simp):,} simp pairs, {elapsed:.1f}s')
 
     def save(self):
+        """Atomic write：先寫 .tmp 再 rename，避免寫到一半 crash 損毀。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # 清掉 runtime 欄位
         clean = [{k: v for k, v in m.items() if not k.startswith('_')}
                  for m in self.movies]
-        with open(self.path, 'w', encoding='utf-8') as f:
-            json.dump(clean, f, ensure_ascii=False, indent=2)
+        # v2.6：包 metadata 層 + 用單行 JSON (indent=None 最快)
+        payload = {
+            'movies': clean,
+            'meta': {
+                'saved_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'last_updated_per_folder': self._last_updated_per_folder,
+                'last_updated_per_series': self._last_updated_per_series,
+            }
+        }
+        tmp_path = self.path.with_suffix(self.path.suffix + '.tmp')
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            _json_dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+        tmp_path.replace(self.path)  # atomic on POSIX, best-effort on Windows
 
     def _format_display(self, m: dict) -> str:
         t = m.get('type', 'Movie')
@@ -361,8 +406,14 @@ class MlongClient:
         return (f'{self.server}/emby/videos/{item_id}/original.mp4'
                 f'?DeviceId={self.device_id}&api_key={self.api_key}')
 
-    def list_folder(self, parent_id: int, include_types: list, label: str = '') -> list:
-        """完整抓 folder 內所有 items。"""
+    def list_folder(self, parent_id: int, include_types: list, label: str = '',
+                     since: str = '') -> list:
+        """完整抓 folder 內所有 items。
+
+        since: ISO date string (例 '2026-09-20T00:00:00')。
+               給值就只抓「該日期後有更新」的 items（incremental update）。
+               萌龍 server 不支援 MinDateLastUpdated 時，會回 0 items → 視為 full sync。
+        """
         movies = []
         start, page = 0, 100
         while True:
@@ -373,10 +424,13 @@ class MlongClient:
                 'StartIndex': start,
                 'Recursive': 'true',
                 'Fields': 'Name,ProductionYear,RunTimeTicks,Type,'
-                          'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,Overview,ParentId',
+                          'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,Overview,ParentId,DateModified',
             }
             if include_types:
                 params['IncludeItemTypes'] = ','.join(include_types)
+            # v2.6 增量：Emby 支援 MinDateLastSaved / MinDateLastUpdated
+            if since:
+                params['MinDateLastSaved'] = since
             r = self.s.get(self._url('/Items'), params=params, timeout=30)
             r.raise_for_status()
             data = r.json()
@@ -404,6 +458,7 @@ class MlongClient:
                     'episode': it.get('IndexNumber') if t == 'Episode' else None,
                     'series_name': it.get('SeriesName', ''),
                     'runtime_ticks': it.get('RunTimeTicks', 0),
+                    'date_modified': it.get('DateModified', ''),
                 })
             print(f'  [{label}] {start + len(items)}/{total}', end='\r')
             start += len(items)
@@ -1282,28 +1337,61 @@ def run_gui(api_key: str):
 
     def run_update_all():
         try:
-            update_status('更新整個 DB 中... 這可能要 14 分鐘')
+            # v2.6：增量更新 — 每個 folder 用 last_updated_per_folder[label] 當 since
+            has_history = bool(db._last_updated_per_folder)
+            update_status('更新整個 DB 中... '
+                          + ('（增量模式）' if has_history else '（首次全抓 ~14分鐘）'))
             all_movies = []
+            incremental_count = 0  # 統計增量模式抓到幾個
             for label, parent_id in KNOWN_FOLDERS.items():
                 if parent_id is None:
                     continue
                 include_types = FOLDER_TYPES.get(label, ['Movie'])
-                update_status(f'  抓 {label} (ParentId={parent_id})...')
-                movies = client.list_folder(parent_id, label, include_types=include_types)
-                all_movies.extend(movies)
-                update_status(f'  ✓ {label}: {len(movies)} 項')
-            # 去重
-            seen = set()
-            unique = []
-            for m in all_movies:
-                if m['id'] not in seen:
-                    seen.add(m['id'])
-                    unique.append(m)
-            db.movies = unique
+                since = db._last_updated_per_folder.get(label, '')
+                if since:
+                    update_status(f'  增量抓 {label} (since {since})...')
+                else:
+                    update_status(f'  全抓 {label} (ParentId={parent_id})...')
+                movies = client.list_folder(parent_id, label,
+                                            include_types=include_types,
+                                            since=since)
+                if since:
+                    # 增量模式：merge 進既有 db.movies（新資料覆蓋舊的）
+                    incremental_count += len(movies)
+                    if movies:
+                        new_ids = {m['id'] for m in movies}
+                        db.movies = [m for m in db.movies
+                                    if not (m.get('folder') == label and m['id'] in new_ids)]
+                        db.movies.extend(movies)
+                    update_status(f'  ↻ {label}: +{len(movies)} 項（增量）')
+                else:
+                    # 首次：全抓，留待後面去重
+                    all_movies.extend(movies)
+                    update_status(f'  ✓ {label}: {len(movies)} 項')
+            if not has_history:
+                # 首次全抓：去重後取代
+                seen = set()
+                unique = []
+                for m in all_movies:
+                    if m['id'] not in seen:
+                        seen.add(m['id'])
+                        unique.append(m)
+                db.movies = unique
+                update_status(f'首次全抓 {len(unique):,} 項')
+            else:
+                update_status(f'增量更新 +{incremental_count} 項')
+            # 更新 metadata 的 last_updated_per_folder（用現在時間）
+            now_iso = time.strftime('%Y-%m-%dT%H:%M:%S')
+            for label in KNOWN_FOLDERS:
+                if KNOWN_FOLDERS[label] is None:
+                    continue
+                db._last_updated_per_folder[label] = now_iso
             db.save()
             db._build_indexes()
-            update_status(f'✓ DB 更新完成：{len(unique):,} 部')
-            messagebox.showinfo('完成', f'更新完成：{len(unique):,} 部')
+            update_status(f'✓ DB 更新完成：{len(db.movies):,} 部')
+            messagebox.showinfo('完成',
+                f'更新完成：{len(db.movies):,} 部'
+                + (f'\n（增量 +{incremental_count}）' if incremental_count else ''))
         except Exception as e:
             update_status(f'✗ 更新失敗: {e}')
             messagebox.showerror('失敗', str(e))
@@ -1414,17 +1502,30 @@ def run_gui(api_key: str):
         try:
             update_status(f'重抓 folder {folder_label} (ParentId={parent_id})...')
             include_types = FOLDER_TYPES.get(folder_label, ['Movie'])
-            new_items = client.list_folder(parent_id, folder_label, include_types=include_types)
-            seen = {it['id'] for it in new_items}
-            # 用 folder 標籤當 filter key
-            before = len(db.movies)
-            db.movies = [m for m in db.movies if m.get('folder') != folder_label]
-            after_remove = len(db.movies)
-            update_status(f'移除 {before - after_remove} 筆舊 {folder_label} entry')
-            added = 0
-            for it in new_items:
-                db.movies.append(it)
-                added += 1
+            # v2.6：傳 since（server 支援就增量，不支援就 full）
+            since = db._last_updated_per_folder.get(folder_label, '')
+            new_items = client.list_folder(parent_id, folder_label,
+                                           include_types=include_types,
+                                           since=since)
+            if not since:
+                # 沒 history → 全替換（舊行為）
+                before = len(db.movies)
+                db.movies = [m for m in db.movies if m.get('folder') != folder_label]
+                after_remove = len(db.movies)
+                update_status(f'移除 {before - after_remove} 筆舊 {folder_label} entry')
+                added = 0
+                for it in new_items:
+                    db.movies.append(it)
+                    added += 1
+            else:
+                # 有 since → 永遠 merge（新資料覆蓋舊的；0 筆代表 server 真的沒更新）
+                new_ids = {it['id'] for it in new_items}
+                db.movies = [m for m in db.movies
+                            if not (m.get('folder') == folder_label and m['id'] in new_ids)]
+                db.movies.extend(new_items)
+                added = len(new_items)
+                update_status(f'增量 +{added} 筆' if added else '增量 0 筆（無更新）')
+            db._last_updated_per_folder[folder_label] = time.strftime('%Y-%m-%dT%H:%M:%S')
             db.save()
             db._build_indexes()
             update_status(f'✓ folder {folder_label} 更新完成（{added} 筆）')

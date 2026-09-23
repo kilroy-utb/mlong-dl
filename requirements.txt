@@ -2,3 +2,5 @@ requests>=2.31.0
 yt-dlp>=2024.1.0
 # v1.4.5: 完整繁簡對照（11,000+ 字）。沒裝會 fallback 到 ~80 字手動 dict。
 zhconv>=1.4.0
+# v2.6: 加速 db.json 讀寫（沒裝會 fallback stdlib，慢 ~3x）
+ujson>=5.0.0
