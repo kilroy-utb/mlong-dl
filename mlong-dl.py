@@ -577,22 +577,135 @@ def run_gui(api_key: str):
             return
         item = do_search.results[idx]
 
-        # Series 自動展開成 episodes
+        # Series 自動展開成 episodes — 開 Detail Dialog 讓用戶選
         if item.get('type') == 'Series':
             episodes = db.get_episodes_for_series(item['id'])
             if not episodes:
                 messagebox.showinfo('提示', '這個 series 沒有 episodes（DB 沒資料）')
                 return
-            if not messagebox.askyesno('展開 series',
-                f'「{item["name"]}」有 {len(episodes)} 集，要全部下載嗎？'):
-                return
-            # 開 thread 依序下載
-            threading.Thread(target=download_episodes_series,
-                           args=(item, episodes), daemon=True).start()
+            # v2.0：開 Detail Dialog（顯示每集 checkbox + 全選/全不選）
+            open_series_detail_dialog(item, episodes)
         else:
             # 單部下載 (Movie 或 Episode)
             threading.Thread(target=download_one_thread,
                            args=(item,), daemon=True).start()
+
+    # v2.0：Series Detail Dialog（列出每集 checkbox + 全選/全不選/反選）
+    def open_series_detail_dialog(series, episodes):
+        """v2.0：彈出 dialog 顯示 series 所有 episodes，每集一個 checkbox。
+        用戶可選要下載哪些。確認後呼叫 download_episodes_series。
+        """
+        dialog = tk.Toplevel(root)
+        dialog.title(f'📺 {series["name"]} — 選擇集數')
+        dialog.geometry('700x600')
+        dialog.transient(root)
+        dialog.grab_set()
+
+        # ── 標題 ──
+        title_frame = ttk.Frame(dialog, padding=10)
+        title_frame.pack(fill='x')
+        ttk.Label(title_frame,
+                  text=f'📺 {series["name"]}  ({len(episodes)} 集)',
+                  font=('TkDefaultFont', 12, 'bold')).pack(side='left')
+
+        # ── 全選 / 全不選 / 反選 按鈕 ──
+        # checkboxes 存在 dialog.check_vars (dict: ep_id -> BooleanVar)
+        dialog.check_vars = {}
+        btn_frame = ttk.Frame(dialog, padding=(10, 0))
+        btn_frame.pack(fill='x')
+
+        def select_all():
+            for v in dialog.check_vars.values():
+                v.set(True)
+            update_count()
+
+        def select_none():
+            for v in dialog.check_vars.values():
+                v.set(False)
+            update_count()
+
+        def invert_selection():
+            for v in dialog.check_vars.values():
+                v.set(not v.get())
+            update_count()
+
+        ttk.Button(btn_frame, text='✓ 全選', command=select_all, width=8).pack(side='left', padx=2)
+        ttk.Button(btn_frame, text='✗ 全不選', command=select_none, width=8).pack(side='left', padx=2)
+        ttk.Button(btn_frame, text='↔ 反選', command=invert_selection, width=8).pack(side='left', padx=2)
+
+        # 計數顯示
+        dialog.count_label = ttk.Label(btn_frame, text='')
+        dialog.count_label.pack(side='right', padx=10)
+
+        # ── 集數列表（用 Canvas + Frame 達成可滾動） ──
+        list_container = ttk.Frame(dialog, padding=10)
+        list_container.pack(fill='both', expand=True)
+
+        canvas = tk.Canvas(list_container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_container, orient='vertical', command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        scroll_frame.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=scroll_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def on_mouse_wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+        # Windows / Linux 的滾輪事件
+        canvas.bind_all('<MouseWheel>', on_mouse_wheel)
+        # Linux 的滾輪 (Button-4/5)
+        canvas.bind_all('<Button-4>', lambda e: canvas.yview_scroll(-1, 'units'))
+        canvas.bind_all('<Button-5>', lambda e: canvas.yview_scroll(1, 'units'))
+
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # 產生每集的 checkbox
+        def update_count():
+            sel = sum(1 for v in dialog.check_vars.values() if v.get())
+            dialog.count_label.config(text=f'已選 {sel}/{len(episodes)}')
+
+        for ep in episodes:
+            sn = ep.get('season') or 1
+            en = ep.get('episode') or 0
+            runtime_min = ep.get('runtime_ticks', 0) // 600000000
+            runtime_str = f'{runtime_min}分' if runtime_min else ''
+            label_text = f"S{int(sn):02d}E{int(en):02d}  {ep['name']}  ({runtime_str})"
+
+            var = tk.BooleanVar(value=True)  # 預設全選
+            dialog.check_vars[ep['id']] = var
+            cb = ttk.Checkbutton(scroll_frame, text=label_text, variable=var,
+                                command=update_count)
+            cb.pack(anchor='w', padx=5, pady=2)
+
+        update_count()
+
+        # ── 底部按鈕 ──
+        bottom_frame = ttk.Frame(dialog, padding=10)
+        bottom_frame.pack(fill='x')
+
+        def on_confirm():
+            selected = [ep for ep in episodes if dialog.check_vars.get(ep['id'], tk.BooleanVar(value=False)).get()]
+            if not selected:
+                messagebox.showinfo('提示', '請至少勾選一集', parent=dialog)
+                return
+            dialog.destroy()
+            # 用新 thread 跑下載
+            threading.Thread(target=download_episodes_series,
+                            args=(series, selected), daemon=True).start()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(bottom_frame, text=f'▶ 下載勾選', command=on_confirm).pack(side='left', padx=5)
+        ttk.Button(bottom_frame, text='取消', command=on_cancel).pack(side='right', padx=5)
+
+        # Dialog 關閉時清 canvas mousewheel bind
+        def on_dialog_close():
+            canvas.unbind_all('<MouseWheel>')
+            dialog.destroy()
+
+        dialog.protocol('WM_DELETE_WINDOW', on_dialog_close)
 
     def download_episodes_series(series, episodes):
         for i, ep in enumerate(episodes, 1):
