@@ -124,66 +124,219 @@ S2T_DICT = {v: k for k, v in T2S_DICT.items()}
 
 
 class MovieDB:
-    """本地電影 DB（從萌龍同步下來）。"""
+    """本地電影 DB（從萌龍同步下來）。
 
-    def __init__(self, path: Path = DB_PATH):
-        self.path = path
+    效能優化（v1.4.0）：
+    - load() 時預先計算 display string、name variants、type，方便 GUI 直接用
+    - 建 inverted index（2-char substring → item_ids），搜尋 O(k) 而非 O(n)
+    - 提供 get_by_id 物件查找（用 dict 而非 list scan）
+    """
+
+    # ── 預先算好的 emoji + 預先算好的 display string 模板 ──
+    TYPE_EMOJI = {
+        'Movie':    '🎬',
+        'Series':   '📺',
+        'Season':   '📀',
+        'Episode':  '🎞️',
+    }
+
+    def __init__(self, path = DB_PATH):
+        self.path = Path(path) if not isinstance(path, Path) else path
         self.movies: list = []
+        # Inverted index: char_pair -> set of movie_id
+        # 例: "阿凡" -> {"51465", "51466", ...}
+        self._index: dict = {}
+        # 簡繁轉換後的 char_pair（方便查詢簡體 query）
+        self._index_simp: dict = {}
+        # name_lower -> item (cache)
+        self._by_id: dict = {}
+        # load 全部預先計算
         self.load()
 
+    @staticmethod
+    def _safe_int(value, default=0):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
+    def _format_display(self, m: dict) -> str:
+        """產生 listbox 顯示用的字串（提前算，後面直接用）。"""
+        t = m.get('type', 'Movie')
+        year = f" ({m['year']})" if m.get('year') else ''
+        ticks = m.get('runtime_ticks', 0)
+        runtime = ''
+        if ticks:
+            total_min = ticks // 600000000
+            if total_min:
+                runtime = f" [{total_min}分]"
+        emoji = self.TYPE_EMOJI.get(t, '❓')
+
+        if t == 'Movie':
+            return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+        elif t == 'Series':
+            return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+        elif t == 'Season':
+            sn = self._safe_int(m.get('season'))
+            return f"[{m['id']:>10}] {emoji} {m.get('series_name', '?')} - S{sn:02d}"
+        elif t == 'Episode':
+            sn = self._safe_int(m.get('season'))
+            ep = self._safe_int(m.get('episode'))
+            series = m.get('series_name') or ''
+            return f"[{m['id']:>10}] {emoji} {series} S{sn:02d}E{ep:02d} 「{m['name']}」{runtime}"
+        return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+
+    @staticmethod
+    def _gen_pairs(s: str):
+        """產生 2-char sliding window pairs。
+        例: '阿凡达' → ['阿凡', '凡达', '达']
+        """
+        if len(s) < 2:
+            yield s
+            return
+        for i in range(len(s) - 1):
+            yield s[i:i+2]
+
     def load(self):
-        if self.path.exists():
-            with open(self.path, encoding='utf-8') as f:
-                self.movies = json.load(f)
+        if not self.path.exists():
+            return
+        with open(self.path, encoding='utf-8') as f:
+            self.movies = json.load(f)
+        self._build_indexes()
+
+    def _build_indexes(self):
+        """預先計算：display string + name_lower + name_alt + inverted index。"""
+        import time
+        t = time.time()
+
+        self._by_id = {}
+        self._index = {}        # pair_lower (繁體) -> set
+        self._index_simp = {}   # pair_simplified (簡體) -> set
+
+        for m in self.movies:
+            mid = m['id']
+
+            # 預先算 display
+            m['_display'] = self._format_display(m)
+
+            # name variants
+            name = m.get('name', '')
+            name_lower = name.lower()
+            m['_name_lower'] = name_lower
+            # 簡轉繁（給「繁→簡」query 用）
+            name_alt = ''.join(S2T_DICT.get(c, c) for c in name)
+            m['_name_alt'] = name_alt.lower()
+            # 繁轉簡（給「簡→繁」query 用）— 萌龍存的是簡體所以這條少用
+            name_simp = ''.join(T2S_DICT.get(c, c) for c in name)
+            m['_name_simp'] = name_simp.lower()
+
+            self._by_id[mid] = m
+
+            # 建 inverted index — 同時存繁 + 簡 pair
+            for variant in (name_lower, name_alt):
+                for pair in self._gen_pairs(variant):
+                    self._index.setdefault(pair, set()).add(mid)
+            # 簡體 pair index（query 是簡體時用）
+            for pair in self._gen_pairs(m['_name_simp']):
+                self._index_simp.setdefault(pair, set()).add(mid)
+
+        elapsed = time.time() - t
+        print(f"  ✓ DB indexed: {len(self.movies):,} items, "
+              f"{len(self._index):,} trad pairs, "
+              f"{len(self._index_simp):,} simp pairs, "
+              f"{elapsed:.1f}s")
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 移除 _display / _name_* 等 runtime 欄位再存
+        clean = []
+        for m in self.movies:
+            clean.append({k: v for k, v in m.items()
+                         if not k.startswith('_')})
         with open(self.path, 'w', encoding='utf-8') as f:
-            json.dump(self.movies, f, ensure_ascii=False, indent=2)
+            json.dump(clean, f, ensure_ascii=False, indent=2)
 
-    def search(self, query: str, limit: int = 20) -> list:
-        """模糊搜尋。自動試繁體 + 簡體兩版本。"""
+    def search(self, query: str, limit: int = 200) -> list:
+        """用 inverted index 搜尋。O(query 長度 × avg pair list)。"""
         q = query.strip().lower()
         if not q:
             return []
-        # 把查詢也做一次繁→簡轉換
-        q_simplified = ''.join(T2S_DICT.get(c, c) for c in q)
 
+        # 兩版本 query（繁 + 簡）
+        q_simplified = ''.join(T2S_DICT.get(c, c) for c in q)
         queries = [q]
         if q_simplified != q:
             queries.append(q_simplified)
 
-        all_results = []
-        seen_ids = set()
-        for search_q in queries:
-            for m in self.movies:
-                if m['id'] in seen_ids:
-                    continue
-                name = m['name'].lower()
-                # 把 DB 名稱也做簡→繁轉換（如果 DB 是簡體存著）
-                name_alt = ''.join(S2T_DICT.get(c, c) for c in name)
-                # substring match（用 in 對 string，不是 set element check）
-                if search_q in name or search_q in name_alt:
-                    all_results.append((m, search_q))
-                    seen_ids.add(m['id'])
+        # Strategy:
+        # - 第一個 query (q) 假設是 user 打的字（可能是繁或簡）
+        #   - 試繁體 index → 簡體 index
+        # - 第二個 query (q_simplified) 是轉換版
+        #   - 試另一個 index
 
-        # 排序：完全 match > 開頭 > substring
-        def score(item):
-            m, _ = item
-            name = m['name'].lower()
-            if name in queries:
-                return 0
-            if any(name.startswith(qq) for qq in queries):
-                return 1
-            return 2
-        all_results.sort(key=score)
-        return [m for m, _ in all_results[:limit]]
+        results = set()
+        primary_pairs = list(self._gen_pairs(queries[0]))
+        if primary_pairs:
+            # 試繁體 index（query 是繁體時）
+            candidate_sets_trad = [self._index.get(p, set()) for p in primary_pairs]
+            candidate_sets_trad = [s for s in candidate_sets_trad if s]
+            if candidate_sets_trad:
+                candidate_sets_trad.sort(key=len)
+                candidates = candidate_sets_trad[0].copy()
+                for s in candidate_sets_trad[1:]:
+                    candidates &= s
+                results |= candidates
+            # 試簡體 index（query 是簡體時）
+            candidate_sets_simp = [self._index_simp.get(p, set()) for p in primary_pairs]
+            candidate_sets_simp = [s for s in candidate_sets_simp if s]
+            if candidate_sets_simp:
+                candidate_sets_simp.sort(key=len)
+                candidates = candidate_sets_simp[0].copy()
+                for s in candidate_sets_simp[1:]:
+                    candidates &= s
+                results |= candidates
+
+        # 第二 query（轉換版）也走 index
+        if len(queries) > 1 and queries[1] != queries[0]:
+            secondary_pairs = list(self._gen_pairs(queries[1]))
+            for index_dict in [self._index, self._index_simp]:
+                sets = [index_dict.get(p, set()) for p in secondary_pairs]
+                sets = [s for s in sets if s]
+                if sets:
+                    sets.sort(key=len)
+                    candidates = sets[0].copy()
+                    for s in sets[1:]:
+                        candidates &= s
+                    results |= candidates
+
+        # 終極 fallback：如果上面都沒找到，substring 掃一次（罕見情況）
+        if not results and queries:
+            for mid, m in self._by_id.items():
+                name = m.get('_name_lower', '')
+                name_alt = m.get('_name_alt', '')
+                for qq in queries:
+                    if qq in name or qq in name_alt:
+                        results.add(mid)
+                        break
+
+        movies = [self._by_id[mid] for mid in results if mid in self._by_id]
+
+        # 排序：完全 match > 開頭 > 其他
+        def get_score(m):
+            name = m.get('_name_lower', '')
+            name_alt = m.get('_name_alt', '')
+            if name in queries or name_alt in queries:
+                return (0, len(name))
+            for qq in queries:
+                if name.startswith(qq) or name_alt.startswith(qq):
+                    return (1, len(name))
+            return (2, len(name))
+
+        movies.sort(key=get_score)
+        return movies[:limit]
 
     def get(self, item_id: str) -> Optional[dict]:
-        for m in self.movies:
-            if m['id'] == item_id:
-                return m
-        return None
+        return self._by_id.get(item_id)
 
 
 # ── Jellyfin API client ──────────────────────────────────────
@@ -661,6 +814,10 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self.config = config
             self.workers = []  # active DownloadWorker
             self.queue_items = []  # 佇列中等待的 movie dicts
+            # v1.4.0 效能：filter cache (quick, type) → movies list
+            self._filter_cache: dict = {}
+            # v1.4.0 效能：debounce search 用的 after id
+            self._search_after_id = None
 
             root.title("萌龍下載器 v3")
             ws = config.get('window_size', (900, 600))
@@ -747,7 +904,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             top.pack(fill='x', padx=5, pady=5)
             ttk.Label(top, text="搜尋:").pack(side='left')
             self.query_var = tk.StringVar(value=self.config.get('last_query', ''))
-            self.query_var.trace('w', self._apply_search_filter)
+            self.query_var.trace('w', self._on_search_change)
             entry = ttk.Entry(top, textvariable=self.query_var, width=50)
             entry.pack(side='left', padx=5)
             entry.bind('<Return>', lambda e: self.start_download_selected())
@@ -776,49 +933,67 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self.search_results = []
             self._apply_search_filter()
 
+        QUICK_FILTERS = {
+            'movie':  lambda m: m.get('type') == 'Movie',
+            'tv':     lambda m: m.get('type') in ('Series', 'Season', 'Episode'),
+            'anime':  lambda m: m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime'),
+            'art':    lambda m: m.get('folder') == 'art',
+            'doc':    lambda m: m.get('folder') == 'documentary',
+            'concert': lambda m: m.get('folder') == 'concert',
+        }
+
+        def _on_search_change(self, *args):
+            """debounce：打字停止 200ms 才真的跑搜尋。"""
+            if self._search_after_id is not None:
+                try:
+                    self.root.after_cancel(self._search_after_id)
+                except Exception:
+                    pass
+            self._search_after_id = self.root.after(200, self._apply_search_filter)
+
         def _apply_search_filter(self, *args):
-            """套用：搜尋字串 + 快捷分類 + 類型下拉。"""
+            """套用：搜尋字串 + 快捷分類 + 類型下拉。
+            v1.4.0 效能：
+              - 不再只 compute 124k list comprehension 兩次
+              - (quick, type) 組合 cache hit → 直接用
+              - 搜尋用 inverted index <20ms
+              - 用預先算的 m['_display']
+            """
             q = self.query_var.get().strip()
             self.config.set('last_query', q)
 
-            base = list(self.db.movies)
-
-            # 快捷分類
             quick = self.quick_filter.get()
-            if quick == 'movie':
-                base = [m for m in base if m.get('type') == 'Movie']
-            elif quick == 'tv':
-                base = [m for m in base if m.get('type') in ('Series', 'Season', 'Episode')]
-            elif quick == 'anime':
-                base = [m for m in base if m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime')]
-            elif quick == 'art':
-                base = [m for m in base if m.get('folder') == 'art']
-            elif quick == 'doc':
-                base = [m for m in base if m.get('folder') == 'documentary']
-            elif quick == 'concert':
-                base = [m for m in base if m.get('folder') == 'concert']
-
-            # 類型下拉
             t = self.type_filter.get()
-            if t != '全部':
-                base = [m for m in base if m.get('type') == t]
 
-            # 搜尋字串
+            # ── 步驟 1：決定 base list（cache by (quick, type)）──
+            cache_key = (quick, t)
+            if cache_key in self._filter_cache:
+                base = self._filter_cache[cache_key]
+            else:
+                # 沒 cache：算一次
+                if quick == 'all' and t == '全部':
+                    base = list(self.db.movies)
+                else:
+                    base = list(self.db.movies)
+                    fn = QUICK_FILTERS.get(quick)
+                    if fn:
+                        base = [m for m in base if fn(m)]
+                    if t != '全部':
+                        base = [m for m in base if m.get('type') == t]
+                self._filter_cache[cache_key] = base
+
+            # ── 步驟 2：套搜尋字串（用 inverted index）──
             if q:
-                base = self.db.search(q, limit=200)
-                # 套用前面的過濾
+                # search() 已做簡繁轉 + 排序
+                candidates = self.db.search(q, limit=200)
+                # 套 quick + type filter
                 if quick != 'all':
-                    quick_filter_func = {
-                        'movie': lambda m: m.get('type') == 'Movie',
-                        'tv': lambda m: m.get('type') in ('Series', 'Season', 'Episode'),
-                        'anime': lambda m: m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime'),
-                        'art': lambda m: m.get('folder') == 'art',
-                        'doc': lambda m: m.get('folder') == 'documentary',
-                        'concert': lambda m: m.get('folder') == 'concert',
-                    }
-                    base = [m for m in base if quick_filter_func[quick](m)]
+                    fn = QUICK_FILTERS.get(quick)
+                    if fn:
+                        candidates = [m for m in candidates if fn(m)]
                 if t != '全部':
-                    base = [m for m in base if m.get('type') == t]
+                    candidates = [m for m in candidates if m.get('type') == t]
+                base = candidates
 
             self.search_results = base
             self._refresh_search_list()
@@ -874,7 +1049,9 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
         def _refresh_search_list(self):
             self.search_listbox.delete(0, 'end')
             for m in self.search_results:
-                self.search_listbox.insert('end', self._format_item(m))
+                # v1.4.0：用預先算好的 _display，不用每次重算
+                display = m.get('_display') or MovieDB._format_display(m)
+                self.search_listbox.insert('end', display)
             self.status_label.config(text=f"顯示 {len(self.search_results):,} 筆")
 
         def on_search(self, *args):
@@ -977,8 +1154,8 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
             self.browse_listbox.delete(0, 'end')
             for m in movies:
-                # browse 額外加 folder 標籤
-                line = self._format_item(m)
+                # v1.4.0：用預先算好的 _display + 加 folder 標籤
+                line = m.get('_display') or MovieDB._format_display(m)
                 folder_tag = f" [{m['folder']}]" if m.get('folder') else ''
                 self.browse_listbox.insert('end', line + folder_tag)
 
