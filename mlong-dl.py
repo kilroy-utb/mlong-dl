@@ -808,6 +808,17 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
     download_dir = Path(config.get('download_dir'))
 
     class App:
+        # v1.4.2 修正：QUICK_FILTERS 移到 class-level（之前放在 _build_search_tab 內
+        # 的 method scope，其他 method 看不到 → AttributeError → 快捷/搜尋沒反應）
+        QUICK_FILTERS = {
+            'movie':  lambda m: m.get('type') == 'Movie',
+            'tv':     lambda m: m.get('type') in ('Series', 'Season', 'Episode'),
+            'anime':  lambda m: m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime'),
+            'art':    lambda m: m.get('folder') == 'art',
+            'doc':    lambda m: m.get('folder') == 'documentary',
+            'concert': lambda m: m.get('folder') == 'concert',
+        }
+
         def __init__(self, root):
             self.root = root
             self.db = db
@@ -950,15 +961,6 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
 
             self.search_results = []
             self._apply_search_filter()
-
-        QUICK_FILTERS = {
-            'movie':  lambda m: m.get('type') == 'Movie',
-            'tv':     lambda m: m.get('type') in ('Series', 'Season', 'Episode'),
-            'anime':  lambda m: m.get('folder') in ('anime_movie', 'jp_anime', 'chinese_anime', 'western_anime'),
-            'art':    lambda m: m.get('folder') == 'art',
-            'doc':    lambda m: m.get('folder') == 'documentary',
-            'concert': lambda m: m.get('folder') == 'concert',
-        }
 
         def _on_search_change(self, *args):
             """debounce：打字停止 200ms 才真的跑搜尋。"""
