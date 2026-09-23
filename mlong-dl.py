@@ -643,20 +643,77 @@ class MlongClient:
 # ── yt-dlp 包裝 ──────────────────────────────────────────────
 def find_ytdlp() -> str:
     """找 yt-dlp 執行檔（PATH 優先，找不到就找常見位置）。"""
-    for name in ['yt-dlp', 'yt_dlp']:
+    # 1. PATH 找
+    for name in ['yt-dlp', 'yt_dlp', 'yt-dlp.exe']:
         path = shutil.which(name)
         if path:
             return path
-    # Fallback 常見 local 安裝位置
-    for p in [
+
+    # 2. 用 Python module 跑（跨平台最終方案）
+    import sys
+    py_exec = sys.executable
+    # 先確認 yt_dlp 模組存在
+    try:
+        import yt_dlp  # noqa
+        # 用「python -m yt_dlp」呼叫
+        return f'"{py_exec}" -m yt_dlp'
+    except ImportError:
+        pass
+
+    # 3. 找常見安裝位置（依平台）
+    candidates = [
+        # Linux/macOS
         os.path.expanduser('~/.local/bin/yt-dlp'),
         '/usr/local/bin/yt-dlp',
         '/opt/homebrew/bin/yt-dlp',
         '/usr/bin/yt-dlp',
-    ]:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
+        # Windows 官方 Python
+        'C:/Python313/Scripts/yt-dlp.exe',
+        'C:/Python312/Scripts/yt-dlp.exe',
+        'C:/Python311/Scripts/yt-dlp.exe',
+        'C:/Python310/Scripts/yt-dlp.exe',
+        # Windows Store Python (你的情況)
+        os.path.expanduser('~/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/Scripts/yt-dlp.exe'),
+        # Windows 通用 - 用 python -m yt_dlp 也算
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
             return p
-    raise RuntimeError("找不到 yt-dlp，請先 `pip install yt-dlp` 或 `brew install yt-dlp`")
+
+    # 4. 在 Windows 額外用 glob 找 Scripts/yt-dlp.exe
+    if sys.platform == 'win32':
+        try:
+            import glob
+            # 找常見 Python 安裝目錄下的 Scripts/
+            search_patterns = [
+                'C:/Python*/Scripts/yt-dlp.exe',
+                os.path.expanduser('~/AppData/Local/Programs/Python/*/Scripts/yt-dlp.exe'),
+                os.path.expanduser('~/AppData/Local/Packages/PythonSoftwareFoundation*/LocalCache/local-packages/Python*/Scripts/yt-dlp.exe'),
+            ]
+            for pat in search_patterns:
+                matches = glob.glob(pat)
+                if matches:
+                    # 用最新的（檔名最後的版本號）
+                    matches.sort()
+                    return matches[-1]
+        except Exception:
+            pass
+
+    # 5. 真的找不到：給詳細錯誤訊息（Windows）
+    extra_help = ''
+    if sys.platform == 'win32':
+        py_exe = sys.executable
+        extra_help = (
+            f'\n\n你用的是：{py_exe}\n'
+            f'試以下指令安裝：\n'
+            f'  {py_exe} -m pip install yt-dlp\n'
+            f'  或  pip install --upgrade yt-dlp'
+        )
+
+    raise RuntimeError(
+        f"找不到 yt-dlp{extra_help}\n"
+        f"（也可在 GUI ⚙ 設定 tab 確認 yt-dlp 路徑是否正確）"
+    )
 
 
 def download_with_ytdlp(url: str, output_path: Path, title_hint: str = "") -> bool:
@@ -668,8 +725,22 @@ def download_with_ytdlp(url: str, output_path: Path, title_hint: str = "") -> bo
     ytdlp = find_ytdlp()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        ytdlp,
+    # 如果 find_ytdlp() 回傳 "python -m yt_dlp" 格式（因為找不到 .exe 但模組在）
+    # 就用 list-style command
+    if ytdlp.endswith('-m yt_dlp') or '-m yt_dlp' in ytdlp:
+        # parse 把 python 跟 -m yt_dlp 分開
+        # 格式: "/path/python" -m yt_dlp  ← 包含 ""
+        import re, shlex
+        m = re.match(r'^"([^"]+)"\s+-m\s+(\S+)$', ytdlp)
+        if m:
+            cmd = [m.group(1), '-m', m.group(2)]
+        else:
+            # fallback 用 shlex 解析
+            cmd = shlex.split(ytdlp)
+    else:
+        cmd = [ytdlp]
+
+    cmd += [
         '-o', str(output_path.with_suffix('.%(ext)s')),
         '--no-mtime',
         '--no-part',
@@ -684,6 +755,7 @@ def download_with_ytdlp(url: str, output_path: Path, title_hint: str = "") -> bo
     print(f"\n▶ yt-dlp 啟動：{url[:80]}...")
     print(f"  輸出: {output_path}")
     print(f"  並發: 8 connections")
+    print(f"  command: {cmd[:3]}... (len={len(cmd)})")
     print()
 
     try:
@@ -1163,6 +1235,8 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
             self._filter_cache: dict = {}
             # v1.4.0 效能：debounce search 用的 after id
             self._search_after_id = None
+            # v1.5.7：錯誤訊息只跳一次（避免連跳 100 個）
+            self._error_shown = False
 
             root.title("萌龍下載器 v3")
             ws = config.get('window_size', (900, 600))
@@ -1779,6 +1853,7 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                 return
             max_concurrent = self.config.get('concurrent_downloads', 1)
             active = len(self.workers)
+            self._error_shown = False  # 重置讓下次失敗會再跳
             while self.queue_items and active < max_concurrent:
                 movie = self.queue_items.pop(0)
                 self._refresh_queue_list()
@@ -1896,6 +1971,14 @@ def cmd_gui(args, client: MlongClient, db: MovieDB):
                     self.active_labels[wid]['text'].config(
                         text=f"✗ {worker.movie['name']} · {err}", foreground='red')
                 self.status_label.config(text=f"✗ 失敗：{worker.movie['name']}")
+                # v1.5.7: 第一次錯誤跳 messagebox（含詳細錯誤）
+                if not self._error_shown:
+                    self._error_shown = True
+                    from tkinter import messagebox
+                    messagebox.showerror(
+                        f"下載失敗：{worker.movie['name']}",
+                        err + ("\n\n（其他任務會繼續跑，錯誤只跳一次）" if len(self.queue_items) > 0 else "")
+                    )
                 self.process_queue()
 
             worker = DownloadWorker(movie, url, out_dir, on_progress, on_done, on_error)
