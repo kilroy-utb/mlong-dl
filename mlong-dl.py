@@ -500,9 +500,13 @@ def run_gui(api_key: str):
     query_var = tk.StringVar()
     entry = ttk.Entry(top, textvariable=query_var, width=40)
     entry.pack(side='left', padx=5)
-    entry.bind('<Return>', lambda e: do_search())
 
-    ttk.Button(top, text='搜尋', command=do_search).pack(side='left', padx=2)
+    # v2.0 修：do_search 必須在使用前定義（Python nested function late-binding）
+    def do_search():
+        q = query_var.get().strip()
+        result_listbox.delete(0, 'end')
+        if not q:
+            result_frame.pack_forget()  # 隱藏結果區
 
     # 更新 DB 按鈕 (dropdown menu)
     update_btn = ttk.Menubutton(top, text='更新 DB ▼')
@@ -532,7 +536,7 @@ def run_gui(api_key: str):
     # 雙擊 = 下載
     result_listbox.bind('<Double-Button-1>', lambda e: on_download_selected())
 
-    # 綁定搜尋
+# v2.0 修：do_search 必須在使用前定義（Python nested function late-binding）
     def do_search():
         q = query_var.get().strip()
         result_listbox.delete(0, 'end')
@@ -552,6 +556,12 @@ def run_gui(api_key: str):
         do_search.query = q
     do_search.results = []
     do_search.query = ''
+
+    # 綁定 Enter 鍵和按鈕（在 do_search 定義後才能綁）
+    entry.bind('<Return>', lambda e: do_search())
+    ttk.Button(top, text='搜尋', command=do_search).pack(side='left', padx=2)
+
+    # 更新 DB 按鈕 (dropdown menu)
 
     # ── 下載 ──────────────────────────────────────────────
     def on_download_selected():
