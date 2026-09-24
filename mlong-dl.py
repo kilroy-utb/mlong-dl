@@ -146,16 +146,8 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 # MovieDB — 純本地 (不 call 萌龍)
 # ═══════════════════════════════════════════════════════════
-class MovieDB:
-    TYPE_EMOJI = {
-        'Movie':   '🎬',
-        'Series':  '📺',
-        'Season':  '📀',
-        'Episode': '🎞️',
-    }
 
-
-# ── v2.6.1：module-level helper ──
+# ── v2.6.1：module-level helper（download_one 也要用）──
 def _safe_int(v, default=0):
     """int() 容錯版（None / 空字串 / 'abc' 都回 default）。"""
     try:
@@ -165,6 +157,13 @@ def _safe_int(v, default=0):
 
 
 class MovieDB:
+    TYPE_EMOJI = {
+        'Movie':   '🎬',
+        'Series':  '📺',
+        'Season':  '📀',
+        'Episode': '🎞️',
+    }
+
     def __init__(self, path: Path = DB_PATH):
         self.path = Path(path) if not isinstance(path, Path) else path
         self.movies = []
