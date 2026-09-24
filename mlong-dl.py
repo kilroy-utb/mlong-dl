@@ -154,6 +154,17 @@ class MovieDB:
         'Episode': '🎞️',
     }
 
+
+# ── v2.6.1：module-level helper ──
+def _safe_int(v, default=0):
+    """int() 容錯版（None / 空字串 / 'abc' 都回 default）。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+class MovieDB:
     def __init__(self, path: Path = DB_PATH):
         self.path = Path(path) if not isinstance(path, Path) else path
         self.movies = []
@@ -170,8 +181,8 @@ class MovieDB:
 
     @staticmethod
     def _safe_int(v, default=0):
-        try: return int(v)
-        except: return default
+        # 委派到 module-level（向下相容）
+        return _safe_int(v, default)
 
     def load(self):
         if not self.path.exists():
