@@ -1693,7 +1693,7 @@ def cmd_update(args):
             continue
         include_types = FOLDER_TYPES.get(label, ['Movie'])
         print(f'  抓 {label}...')
-        movies = client.list_folder(parent_id, label, include_types=include_types)
+        movies = client.list_folder(parent_id, label=label, include_types=include_types)
         print(f'  ✓ {label}: {len(movies)} 項')
         all_movies.extend(movies)
     seen = set()
