@@ -476,6 +476,33 @@ class MlongClient:
                 break
         return movies
 
+    def search_series_by_name(self, name: str) -> list:
+        """v2.6.4：用 SearchTerm API 找「最新」的 Series items（id 可能跟 DB 不同）。
+
+        萌龍 Emby API: GET /Items?SearchTerm=xxx&IncludeItemTypes=Series
+        回傳 list of dict: [{id, name, year, type}, ...]（多個結果時取 name 完全相符的第一個）
+
+        回傳 [] 表示沒找到（可能系列被刪除/改名）。
+        """
+        r = self.s.get(self._url('/Items'), params={
+            'api_key': self.api_key,
+            'SearchTerm': name,
+            'IncludeItemTypes': 'Series',
+            'Recursive': 'true',
+            'Fields': 'Name,ProductionYear,RunTimeTicks,Type,SeriesName,IndexNumber,Overview,ParentId',
+        }, timeout=30)
+        r.raise_for_status()
+        items = r.json().get('Items', [])
+        results = []
+        for it in items:
+            results.append({
+                'id': str(it.get('Id')),
+                'name': it.get('Name', ''),
+                'year': it.get('ProductionYear', ''),
+                'type': it.get('Type', ''),
+            })
+        return results
+
     def get_series_full_tree(self, series_id: str, label: str = '') -> list:
         """抓單 series 樹（用 ?Ids + ParentId Recursive）。"""
         items = []
@@ -1418,9 +1445,41 @@ def run_gui(api_key: str):
     def run_update_single(sid):
         try:
             update_status(f'更新 series {sid} 中...')
-            # 先從 DB 找 folder
+            # 先從 DB 找 folder 跟 series_name
             existing = db.get(sid)
             label = existing.get('folder', '') if existing else ''
+            series_name = existing.get('name', '') if existing else ''
+
+            # v2.6.4：先用 series_name 從萌龍 search 拿「最新」的 series id
+            # 避免 DB 裡的 id 已經過期（萌龍刪除/重傳後 id 會變）
+            if series_name:
+                update_status(f'查萌龍最新 series id (name="{series_name}")...')
+                candidates = client.search_series_by_name(series_name)
+                # 取 name 完全相符的第一個
+                match = next((c for c in candidates if c['name'] == series_name), None)
+                if match:
+                    new_sid = match['id']
+                    if new_sid != sid:
+                        update_status(f'⚠ series id 變了：{sid} → {new_sid}')
+                        if not messagebox.askyesno('series id 變動',
+                            f'萌龍的 series id 跟 DB 記錄的不一樣：\n\n'
+                            f'  DB 裡:    {sid}\n'
+                            f'  萌龍最新:  {new_sid}\n\n'
+                            f'用萌龍最新的 id 更新？'):
+                            update_status('更新取消（user 拒絕新 id）')
+                            return
+                        sid = new_sid
+                    update_status(f'確認 series id = {sid} ({series_name})')
+                else:
+                    update_status(f'⚠ 萌龍找不到 name="{series_name}" 的 series，跳過 id 確認')
+                    if not messagebox.askyesno('找不到 series',
+                        f'萌龍查不到 name 完全相符的「{series_name}」\n\n'
+                        f'萌龍 search 回傳 {len(candidates)} 筆：\n'
+                        + '\n'.join(f'  - [{c["id"]}] {c["name"]}' for c in candidates[:5])
+                        + '\n\n繼續用 DB 裡的 id {sid} 更新嗎？'):
+                        update_status('更新取消（user 拒絕）')
+                        return
+
             new_items = client.get_series_full_tree(sid, label=label)
             update_status(f'fetch 到 {len(new_items)} 筆')
 
@@ -1488,7 +1547,8 @@ def run_gui(api_key: str):
                 return
             if not messagebox.askyesno('確認更新',
                 f'從 episode「{item["name"]}」找到 parent series「{parent["name"]}」\n\n'
-                f'重抓整個 series tree？這會替換所有 seasons + episodes。'):
+                f'重抓整個 series tree？這會替換所有 seasons + episodes。\n\n'
+                f'（會先 fetch 萌龍確認 series id 沒漂移）'):
                 return
             threading.Thread(target=run_update_single,
                             args=(parent['id'],), daemon=True).start()
