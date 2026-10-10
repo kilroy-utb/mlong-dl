@@ -476,6 +476,54 @@ class MlongClient:
                 break
         return movies
 
+    def get_item_meta(self, item_id: str) -> Optional[dict]:
+        """v2.7.2：用 Emby /Items/{Id} 查單一 item 的 metadata。
+
+        回傳 None 表示找不到（id 不存在 / 沒權限）。
+        回傳 dict: {id, name, type, folder?, parent_id?, season?, episode?, ...}
+        """
+        r = self.s.get(self._url(f'/Items/{item_id}'), params={
+            'api_key': self.api_key,
+            'Fields': 'Name,ProductionYear,RunTimeTicks,Type,'
+                      'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,'
+                      'Overview,ParentId,DateModified,Path',
+        }, timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        it = r.json()
+        name = it.get('Name', '')
+        t = it.get('Type', '')
+        year = ''
+        m = re.search(r'\((\d{4})\)', name)
+        if m:
+            year = m.group(1)
+        # folder 從 path 反推（v2.6 起 KNOWN_FOLDERS 也對得上 Path 末段）
+        folder = ''
+        path = it.get('Path', '')
+        if path:
+            # path 形如 /Movies/功夫女足 (2024) [imdbid]/... 或 /Series/xxx/...
+            # 用「往上找 path 段有沒有對到 parent_id 的 folder name」
+            # 簡化：只抓第一個 path segment
+            segs = [s for s in path.replace('\\', '/').split('/') if s]
+            if segs:
+                folder = segs[0]
+        return {
+            'id': str(it.get('Id')),
+            'name': name,
+            'year': year,
+            'folder': folder,
+            'type': t,
+            'parent_id': str(it.get('ParentId', '')) if it.get('ParentId') is not None else '',
+            'season': it.get('ParentIndexNumber') if t == 'Episode' else it.get('IndexNumber'),
+            'episode': it.get('IndexNumber') if t == 'Episode' else None,
+            'series_name': it.get('SeriesName', ''),
+            'runtime_ticks': it.get('RunTimeTicks', 0),
+            'date_modified': it.get('DateModified', ''),
+            'overview': it.get('Overview', ''),
+            'path': path,
+        }
+
     def search_series_by_name(self, name: str) -> list:
         """v2.6.4：用 SearchTerm API 找「最新」的 Series items（id 可能跟 DB 不同）。
 
@@ -1987,6 +2035,82 @@ def cmd_search(args):
         print(db.get_display(m['id']))
 
 
+def cmd_info(args):
+    """v2.7.2：查單一 item 在萌龍 server 上的 metadata。
+
+    --save：把這筆寫進 db.json（處理「db 找不到但 download 能用」的狀況）
+    """
+    api_key = args.api_key or os.environ.get('MLONG_API_KEY', '')
+    if not api_key:
+        print('✗ 需要 api_key')
+        sys.exit(1)
+    client = MlongClient(DEFAULT_SERVER, api_key)
+    item_id = args.item_id
+    print(f'▶ 查 item {item_id} ...')
+    meta = client.get_item_meta(item_id)
+    if not meta:
+        print(f'✗ server 找不到 id={item_id}（404）')
+        sys.exit(2)
+    db = MovieDB()
+    in_db = bool(db.get(item_id))
+    print(f'\n=== Server 回報 ===')
+    print(f'  id:          {meta["id"]}')
+    print(f'  name:        {meta["name"]}')
+    print(f'  type:        {meta["type"]}')
+    if meta.get('year'):
+        print(f'  year:        {meta["year"]}')
+    if meta.get('folder'):
+        print(f'  folder:      {meta["folder"]}  （path 第一段）')
+    if meta.get('parent_id'):
+        print(f'  parent_id:   {meta["parent_id"]}')
+    if meta.get('series_name'):
+        print(f'  series_name: {meta["series_name"]}')
+    if meta.get('type') == 'Episode':
+        print(f'  S{meta["season"]:>02}E{meta["episode"]:>02}')
+    if meta.get('date_modified'):
+        print(f'  modified:    {meta["date_modified"]}')
+    if meta.get('path'):
+        print(f'  path:        {meta["path"]}')
+    print(f'\n=== DB 狀態 ===')
+    print(f'  在 db 裡:    {"✓ 有" if in_db else "✗ 無"}')
+    if not in_db:
+        # 反推這個 item 可能是哪個 known folder 漏網之魚
+        path = meta.get('path', '')
+        folder_candidates = []
+        for label, parent_id in KNOWN_FOLDERS.items():
+            if parent_id is None:
+                continue
+            # 比對 path 跟 label,或比對 meta.folder 跟 label
+            if label.lower() in path.lower() or meta.get('folder', '').lower() == label.lower():
+                folder_candidates.append(label)
+        if folder_candidates:
+            print(f'  可能 folder: {", ".join(folder_candidates)}')
+        else:
+            print(f'  無法反推 folder（路徑不對到 KNOWN_FOLDERS）')
+        print(f'  → 它為什麼 list_folder 沒撈到: 可能在某 sub-folder / playlist / user list')
+    if args.save:
+        if in_db:
+            print(f'\n⚠ db 已有這筆, --save 不覆蓋')
+            sys.exit(0)
+        # 寫進 db
+        db.movies.append({
+            'id': meta['id'],
+            'name': meta['name'],
+            'year': meta.get('year', ''),
+            'folder': meta.get('folder', ''),
+            'type': meta['type'],
+            'parent_id': meta.get('parent_id', ''),
+            'season': meta.get('season'),
+            'episode': meta.get('episode'),
+            'series_name': meta.get('series_name', ''),
+            'runtime_ticks': meta.get('runtime_ticks', 0),
+            'date_modified': meta.get('date_modified', ''),
+        })
+        db.save()
+        db._build_indexes()
+        print(f'\n✓ 已加入 db ({len(db.movies):,} 部)')
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(
@@ -2021,6 +2145,13 @@ def main():
     p_search = sub.add_parser('search', help='搜尋 DB')
     p_search.add_argument('query')
     p_search.set_defaults(func=cmd_search)
+
+    # info
+    p_info = sub.add_parser('info', help='查單一 item 在萌龍 server 的 metadata')
+    p_info.add_argument('item_id', help='ItemId（例 384129）')
+    p_info.add_argument('--save', action='store_true',
+                        help='把這筆寫進 db.json（不在 db 時）')
+    p_info.set_defaults(func=cmd_info)
 
     args = p.parse_args()
     if hasattr(args, 'func'):
