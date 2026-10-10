@@ -950,8 +950,10 @@ def run_gui(api_key: str):
     # 更新 DB 按鈕 (dropdown menu)
     update_btn = ttk.Menubutton(top, text='更新 DB ▼')
     update_menu = tk.Menu(update_btn, tearoff=0)
-    update_menu.add_command(label='更新整個 DB (慢, 14分鐘)',
+    update_menu.add_command(label='更新整個 DB (增量,通常幾秒)',
                            command=lambda: update_all())
+    update_menu.add_command(label='選擇 folders 更新...',
+                           command=lambda: update_choose_folders())
     update_menu.add_command(label='更新單個 series (打 ID)',
                            command=lambda: update_single())
     update_menu.add_command(label='更新單個 series (從搜尋結果)',
@@ -1368,9 +1370,108 @@ def run_gui(api_key: str):
     # ── 更新 DB ────────────────────────────────────────────
     def update_all():
         if not messagebox.askyesno('更新整個 DB',
-            '這會花 14 分鐘從萌龍抓所有 17 個 folder 的電影。\n\n繼續？'):
+            '從萌龍抓所有 17 個 folder（首次 ~14 分鐘, 之後增量通常幾秒）。\n\n繼續？'):
             return
         threading.Thread(target=run_update_all, daemon=True).start()
+
+    def update_choose_folders():
+        """v2.7：彈 dialog 讓 user 勾選要更新的 folders。"""
+        # 算每個 folder 目前 db 裡幾筆 + 最後 update 時間
+        counts = {}
+        for m in db.movies:
+            f = m.get('folder') or '?'
+            counts[f] = counts.get(f, 0) + 1
+        last = db._last_updated_per_folder
+
+        dlg = tk.Toplevel(root)
+        dlg.title('選擇 folders 更新')
+        dlg.geometry('560x520')
+        dlg.transient(root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text='勾選要更新的 folders（沒勾的不會動）',
+                  padding=(10, 8)).pack(fill='x')
+
+        # 全選/全不選/反選
+        btns = ttk.Frame(dlg, padding=(10, 0))
+        btns.pack(fill='x')
+        # Listbox（多選 EXTENDED = Ctrl/Shift 多選）
+        list_frame = ttk.Frame(dlg, padding=10)
+        list_frame.pack(fill='both', expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical')
+        lb = tk.Listbox(list_frame, selectmode='extended', height=18,
+                        font=('TkFixedFont', 10),
+                        yscrollcommand=scrollbar.set)
+        scrollbar.config(command=lb.yview)
+        lb.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # 填資料：每行 "label (count 筆, since xxx)"
+        row_labels = []
+        for label, parent_id in KNOWN_FOLDERS.items():
+            if parent_id is None:
+                continue
+            n = counts.get(label, 0)
+            ts = last.get(label, '')
+            ts_show = ts[:10] if ts else '從未'
+            line = f'{label:<14} {n:>7,} 項   最後更新 {ts_show}'
+            lb.insert('end', line)
+            row_labels.append(label)
+
+        def sel_all():
+            lb.select_set(0, 'end')
+        def sel_none():
+            lb.select_clear(0, 'end')
+        def sel_invert():
+            for i in range(lb.size()):
+                if lb.select_includes(i):
+                    lb.select_clear(i)
+                else:
+                    lb.select_set(i)
+        ttk.Button(btns, text='✓ 全選', width=8, command=sel_all).pack(side='left', padx=2)
+        ttk.Button(btns, text='✗ 全不選', width=8, command=sel_none).pack(side='left', padx=2)
+        ttk.Button(btns, text='↔ 反選', width=8, command=sel_invert).pack(side='left', padx=2)
+        ttk.Label(btns, text='提示：第一次按「✓ 全選」= 首次全抓 ~14 分鐘').pack(side='right', padx=5)
+
+        # 確認 / 取消
+        result = {'labels': None}
+        def on_ok():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning('沒選', '至少勾一個 folder', parent=dlg)
+                return
+            result['labels'] = [row_labels[i] for i in sel]
+            dlg.destroy()
+        def on_cancel():
+            dlg.destroy()
+        bottom = ttk.Frame(dlg, padding=10)
+        bottom.pack(fill='x')
+        ttk.Button(bottom, text='更新', command=on_ok).pack(side='right', padx=5)
+        ttk.Button(bottom, text='取消', command=on_cancel).pack(side='right')
+        dlg.bind('<Escape>', lambda e: on_cancel())
+        dlg.bind('<Return>', lambda e: on_ok())
+        dlg.protocol('WM_DELETE_WINDOW', on_cancel)
+
+        root.wait_window(dlg)
+        if not result['labels']:
+            return
+        labels = result['labels']
+        if not messagebox.askyesno('確認更新',
+            f'將增量更新 {len(labels)} 個 folder:\n  ' +
+            ', '.join(labels) + '\n\n其他 folders 不會動。\n繼續？'):
+            return
+        threading.Thread(target=run_update_chosen,
+                        args=(labels,), daemon=True).start()
+
+    def run_update_chosen(labels):
+        try:
+            update_status(f'▶ 更新 {len(labels)} 個 folder...')
+            update_folders(labels, api_key, status=update_status)
+            messagebox.showinfo('完成',
+                f'更新完成：{len(db.movies):,} 部')
+        except Exception as e:
+            update_status(f'✗ 更新失敗: {e}')
+            messagebox.showerror('失敗', str(e))
 
     def run_update_all():
         try:
@@ -1715,56 +1816,137 @@ def cmd_gui(args):
     run_gui(api_key)
 
 
+def _update_one_series(sid: str, api_key: str, status=None):
+    """更新單個 series（含其下所有 season/episode）。GUI/CLI 共用。"""
+    s = status or (lambda m: None)
+    log(f'▶ 更新 series {sid}...')
+    client = MlongClient(DEFAULT_SERVER, api_key)
+    db = MovieDB()
+    existing = db.get(sid)
+    label = existing.get('folder', '') if existing else ''
+    new_items = client.get_series_full_tree(sid, label=label)
+    log(f'  fetch 到 {len(new_items)} 筆')
+    ids_to_remove = db.get_series_tree_ids(sid) if existing else {sid}
+    db.movies = [m for m in db.movies if m['id'] not in ids_to_remove]
+    seen = {m['id'] for m in db.movies}
+    added = 0
+    for it in new_items:
+        if it['id'] not in seen:
+            db.movies.append(it)
+            seen.add(it['id'])
+            added += 1
+    log(f'  加入 {added} 筆新 entry')
+    db.save()
+    db._build_indexes()
+    log(f'✓ series {sid} 更新完成')
+
+
+def update_folders(labels: list, api_key: str, status=None):
+    """v2.7：增量更新指定 folders（GUI dialog / CLI 共用）。
+
+    - labels: KNOWN_FOLDERS 的 key list（只更新這幾個）
+    - 其他 folders 的 db 資料完全不動,也不更新 _last_updated_per_folder
+    - 全抓 / 增量模式依各 folder 的 since= 是否存在決定（沿用 v2.6 邏輯）
+    """
+    s = status or (lambda m: None)
+    if not labels:
+        s('✗ 沒選任何 folder')
+        return 0, 0
+    # 過濾掉 None / 不認得的 label
+    valid = [l for l in labels if KNOWN_FOLDERS.get(l) is not None]
+    unknown = [l for l in labels if l not in KNOWN_FOLDERS]
+    if unknown:
+        s(f'⚠ 不認得的 folder: {unknown}（跳過）')
+    if not valid:
+        s('✗ 沒有有效的 folder')
+        return 0, 0
+
+    client = MlongClient(DEFAULT_SERVER, api_key)
+    db = MovieDB()
+    has_history = bool(db._last_updated_per_folder)
+    s(f'▶ 更新 {len(valid)} 個 folder: {", ".join(valid)}')
+    s('  （增量模式）' if has_history else '  （首次全抓,可能較慢）')
+
+    all_movies = []
+    incremental_count = 0
+    new_seen = {}  # 該 folder 這次新抓到 item id set（給增量 merge 用）
+    for label in valid:
+        parent_id = KNOWN_FOLDERS[label]
+        include_types = FOLDER_TYPES.get(label, ['Movie'])
+        since = db._last_updated_per_folder.get(label, '')
+        if since:
+            s(f'  增量抓 {label} (since {since})...')
+        else:
+            s(f'  全抓 {label} (ParentId={parent_id})...')
+        try:
+            movies = client.list_folder(parent_id, include_types,
+                                        label=label, since=since)
+        except Exception as e:
+            s(f'  ✗ {label} 抓失敗: {e}')
+            continue
+        if since:
+            incremental_count += len(movies)
+            if movies:
+                new_ids = {m['id'] for m in movies}
+                db.movies = [m for m in db.movies
+                            if not (m.get('folder') == label and m['id'] in new_ids)]
+                db.movies.extend(movies)
+            s(f'  ↻ {label}: +{len(movies)} 項（增量）')
+        else:
+            all_movies.extend(movies)
+            s(f'  ✓ {label}: {len(movies)} 項')
+
+    if not has_history:
+        # 任何 folder 首次全抓 → 去重後取代 db
+        # 但只動到「這次 valid 裡全抓到的 folder」？其實首次一定是 valid 全勾才會跑這條
+        seen = set()
+        unique = []
+        for m in all_movies:
+            if m['id'] not in seen:
+                seen.add(m['id'])
+                unique.append(m)
+        # 保留 valid 之外的 folder 既有資料
+        valid_set = set(valid)
+        keep = [m for m in db.movies if m.get('folder') not in valid_set]
+        # 但首次全抓若 valid 包含全部 known folders,keep 會是空的,行為等同 v2.6
+        db.movies = keep + unique
+        s(f'首次全抓 {len(unique):,} 項（保留其他 folder {len(keep):,} 項）')
+    else:
+        s(f'增量更新 +{incremental_count} 項')
+
+    # 只更新「這次真的跑了」的 folder 的 last_updated_per_folder
+    now_iso = time.strftime('%Y-%m-%dT%H:%M:%S')
+    for label in valid:
+        db._last_updated_per_folder[label] = now_iso
+    db.save()
+    db._build_indexes()
+    s(f'✓ DB 更新完成：{len(db.movies):,} 部')
+    return len(valid), incremental_count
+
+
 def cmd_update(args):
     api_key = args.api_key or os.environ.get('MLONG_API_KEY', '')
     if not api_key:
         print('✗ 需要 api_key')
         sys.exit(1)
-    client = MlongClient(DEFAULT_SERVER, api_key)
-    db = MovieDB()
 
     if getattr(args, 'series_id', None):
-        # 單 series
-        sid = args.series_id
-        print(f'▶ 更新 series {sid}...')
-        existing = db.get(sid)
-        label = existing.get('folder', '') if existing else ''
-        new_items = client.get_series_full_tree(sid, label=label)
-        print(f'  fetch 到 {len(new_items)} 筆')
-        ids_to_remove = db.get_series_tree_ids(sid) if existing else {sid}
-        db.movies = [m for m in db.movies if m['id'] not in ids_to_remove]
-        seen = {m['id'] for m in db.movies}
-        added = 0
-        for it in new_items:
-            if it['id'] not in seen:
-                db.movies.append(it)
-                seen.add(it['id'])
-                added += 1
-        print(f'  加入 {added} 筆新 entry')
-        db.save()
-        db._build_indexes()
-        print(f'✓ series {sid} 更新完成')
+        _update_one_series(args.series_id, api_key, status=print)
         return
 
-    print('▶ 從萌龍同步所有電影清單...')
-    all_movies = []
-    for label, parent_id in KNOWN_FOLDERS.items():
-        if parent_id is None:
-            continue
-        include_types = FOLDER_TYPES.get(label, ['Movie'])
-        print(f'  抓 {label}...')
-        movies = client.list_folder(parent_id, label=label, include_types=include_types)
-        print(f'  ✓ {label}: {len(movies)} 項')
-        all_movies.extend(movies)
-    seen = set()
-    unique = []
-    for m in all_movies:
-        if m['id'] not in seen:
-            seen.add(m['id'])
-            unique.append(m)
-    db.movies = unique
-    db.save()
-    print(f'✓ DB 更新完成：{len(unique)} 部 → {db.path}')
+    # v2.7：解析 --folder / --type
+    labels = list(getattr(args, 'folder', []) or [])
+    types = list(getattr(args, 'type', []) or [])
+    if types:
+        for t in types:
+            for lbl, ltypes in FOLDER_TYPES.items():
+                if t in ltypes and KNOWN_FOLDERS.get(lbl) is not None:
+                    if lbl not in labels:
+                        labels.append(lbl)
+    if not labels or (len(labels) == 1 and labels[0] == 'all'):
+        labels = [l for l, pid in KNOWN_FOLDERS.items() if pid is not None]
+        print(f'▶ 沒指定 folder → 更新全部 {len(labels)} 個')
+    update_folders(labels, api_key, status=print)
 
 
 def cmd_download(args):
@@ -1813,8 +1995,13 @@ def main():
     p_gui.set_defaults(func=cmd_gui)
 
     # update
-    p_upd = sub.add_parser('update', help='更新 DB')
+    p_upd = sub.add_parser('update', help='更新 DB（v2.7：可指定 folder / type）')
     p_upd.add_argument('--series', dest='series_id', help='只更新某個 series')
+    p_upd.add_argument('--folder', action='append', default=[],
+                       help='只更新指定 folder（可重複）。例：--folder chinese --folder art')
+    p_upd.add_argument('--type', action='append', default=[],
+                       choices=['Movie', 'Series', 'Season', 'Episode'],
+                       help='只更新含此 type 的 folder（可重複）。例：--type Movie')
     p_upd.set_defaults(func=cmd_update)
 
     # download
