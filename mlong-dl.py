@@ -1469,6 +1469,10 @@ def run_gui(api_key: str):
             update_folders(labels, api_key, status=update_status)
             messagebox.showinfo('完成',
                 f'更新完成：{len(db.movies):,} 部')
+            # v2.7.1：如果使用者之前有搜過,自動重跑搜尋讓 Listbox 刷新
+            # （thread 裡不能直接動 widget,丟回 main thread）
+            if getattr(do_search, 'query', ''):
+                root.after(0, do_search)
         except Exception as e:
             update_status(f'✗ 更新失敗: {e}')
             messagebox.showerror('失敗', str(e))
@@ -1530,6 +1534,9 @@ def run_gui(api_key: str):
             messagebox.showinfo('完成',
                 f'更新完成：{len(db.movies):,} 部'
                 + (f'\n（增量 +{incremental_count}）' if incremental_count else ''))
+            # v2.7.1：自動重跑搜尋讓 Listbox 刷新
+            if getattr(do_search, 'query', ''):
+                root.after(0, do_search)
         except Exception as e:
             update_status(f'✗ 更新失敗: {e}')
             messagebox.showerror('失敗', str(e))
