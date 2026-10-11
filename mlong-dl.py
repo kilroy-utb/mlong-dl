@@ -156,6 +156,23 @@ def _safe_int(v, default=0):
         return default
 
 
+def _fmt_size(n) -> str:
+    """v2.7.3：bytes → 人類可讀（4.2 GB / 780 MB）。
+
+    n <= 0 或 None 回 ''（不顯示）。
+    """
+    n = _safe_int(n, 0)
+    if n <= 0:
+        return ''
+    if n >= 1024 ** 3:
+        return f'{n / 1024 ** 3:.1f} GB'
+    if n >= 1024 ** 2:
+        return f'{n / 1024 ** 2:.0f} MB'
+    if n >= 1024:
+        return f'{n / 1024:.0f} KB'
+    return f'{n} B'
+
+
 class MovieDB:
     TYPE_EMOJI = {
         'Movie':   '🎬',
@@ -260,12 +277,14 @@ class MovieDB:
         year = f" ({m['year']})" if m.get('year') else ''
         ticks = m.get('runtime_ticks', 0)
         runtime = f" [{ticks//600000000}分]" if ticks else ''
+        size = _fmt_size(m.get('size_bytes', 0))
+        size_str = f" {size}" if size else ''
         emoji = self.TYPE_EMOJI.get(t, '❓')
 
         if t == 'Movie':
-            return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+            return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}{size_str}"
         elif t == 'Series':
-            return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+            return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}{size_str}"
         elif t == 'Season':
             sn = self._safe_int(m.get('season'))
             return f"[{m['id']:>10}] {emoji} {m.get('series_name','?')} - S{sn:02d}"
@@ -273,8 +292,8 @@ class MovieDB:
             sn = self._safe_int(m.get('season'))
             ep = self._safe_int(m.get('episode'))
             series = m.get('series_name') or ''
-            return f"[{m['id']:>10}] {emoji} {series} S{sn:02d}E{ep:02d} 「{m['name']}」{runtime}"
-        return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}"
+            return f"[{m['id']:>10}] {emoji} {series} S{sn:02d}E{ep:02d} 「{m['name']}」{runtime}{size_str}"
+        return f"[{m['id']:>10}] {emoji} {m['name']}{year}{runtime}{size_str}"
 
     def get(self, item_id: str) -> Optional[dict]:
         return self._by_id.get(item_id)
@@ -434,7 +453,7 @@ class MlongClient:
                 'StartIndex': start,
                 'Recursive': 'true',
                 'Fields': 'Name,ProductionYear,RunTimeTicks,Type,'
-                          'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,Overview,ParentId,DateModified',
+                          'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,Overview,ParentId,DateModified,MediaSources',
             }
             if include_types:
                 params['IncludeItemTypes'] = ','.join(include_types)
@@ -457,6 +476,11 @@ class MlongClient:
                 m = re.search(r'\((\d{4})\)', name)
                 if m:
                     year = m.group(1)
+                # v2.7.3：file size 從 MediaSources[0].Size
+                size_bytes = 0
+                ms_list = it.get('MediaSources') or []
+                if ms_list:
+                    size_bytes = _safe_int(ms_list[0].get('Size', 0), 0)
                 movies.append({
                     'id': str(it.get('Id')),
                     'name': name,
@@ -469,6 +493,7 @@ class MlongClient:
                     'series_name': it.get('SeriesName', ''),
                     'runtime_ticks': it.get('RunTimeTicks', 0),
                     'date_modified': it.get('DateModified', ''),
+                    'size_bytes': size_bytes,
                 })
             print(f'  [{label}] {start + len(items)}/{total}', end='\r')
             start += len(items)
@@ -486,7 +511,7 @@ class MlongClient:
             'api_key': self.api_key,
             'Fields': 'Name,ProductionYear,RunTimeTicks,Type,'
                       'SeriesName,SeasonNumber,EpisodeNumber,IndexNumber,'
-                      'Overview,ParentId,DateModified,Path',
+                      'Overview,ParentId,DateModified,Path,MediaSources',
         }, timeout=30)
         if r.status_code == 404:
             return None
@@ -508,6 +533,11 @@ class MlongClient:
             segs = [s for s in path.replace('\\', '/').split('/') if s]
             if segs:
                 folder = segs[0]
+        # v2.7.3：file size
+        size_bytes = 0
+        ms_list = it.get('MediaSources') or []
+        if ms_list:
+            size_bytes = _safe_int(ms_list[0].get('Size', 0), 0)
         return {
             'id': str(it.get('Id')),
             'name': name,
@@ -522,6 +552,7 @@ class MlongClient:
             'date_modified': it.get('DateModified', ''),
             'overview': it.get('Overview', ''),
             'path': path,
+            'size_bytes': size_bytes,
         }
 
     def search_series_by_name(self, name: str) -> list:
@@ -2071,6 +2102,9 @@ def cmd_info(args):
         print(f'  modified:    {meta["date_modified"]}')
     if meta.get('path'):
         print(f'  path:        {meta["path"]}')
+    sz = _fmt_size(meta.get('size_bytes', 0))
+    if sz:
+        print(f'  size:        {sz}  ({meta.get("size_bytes", 0):,} bytes)')
     print(f'\n=== DB 狀態 ===')
     print(f'  在 db 裡:    {"✓ 有" if in_db else "✗ 無"}')
     if not in_db:
@@ -2105,6 +2139,7 @@ def cmd_info(args):
             'series_name': meta.get('series_name', ''),
             'runtime_ticks': meta.get('runtime_ticks', 0),
             'date_modified': meta.get('date_modified', ''),
+            'size_bytes': meta.get('size_bytes', 0),
         })
         db.save()
         db._build_indexes()
